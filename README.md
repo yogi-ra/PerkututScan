@@ -4,7 +4,7 @@
 
 This project, **Perkutut Scan**, is an automated Static Application Security Testing (SAST) tool that leverages Nuclei for vulnerability scanning, enhanced with Artificial Intelligence for more insightful analysis. Developed as a lightweight and portable Bash script, it seamlessly integrates into the development pipeline to detect potential security flaws before they reach production.
 
-The system uses Nuclei with custom configurations for static analysis, Regex for pattern matching, and an AI model (Gemma 3 via Ollama) to provide detailed explanations and risk assessments for identified vulnerabilities.
+The system uses Nuclei with custom configurations for static analysis, Regex for pattern matching, and an AI model to provide detailed explanations and risk assessments for identified vulnerabilities.
 
 -----
 
