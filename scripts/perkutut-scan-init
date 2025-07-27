@@ -1,0 +1,110 @@
+#!/bin/bash
+# =============================================================
+# Author:
+#         - Antoni Haikal
+#         - Yogi Rahman Alif
+#         - Fathur Wiriansyah
+#         - Joenery Pratama
+#         - R.M. Sultan Arif Syaidinah Hadi
+#         - Muhammad Hafiz Pratama
+#         - Putri Syajah
+#
+# pre-push init file for Automated SAST with Nuclei
+# =============================================================
+
+PRE_PUSH_FILE="pre-push"
+MAIN_SCRIPT="perkutut-scan" # This file must exist in the same directory as this script
+
+checkDependencies() {
+  local dependencies=(git)
+  for dep in "${dependencies[@]}"; do
+    if ! command -v "$dep" &>/dev/null; then
+      echo "❌ Missing dependency: $dep"
+      exit 1
+    fi
+  done
+}
+
+interactiveConfig() {
+  echo "🛠️  Interactive setup for Nuclei SAST pre-push hook"
+
+  read -rp "🤖 Enable AI analysis? (y/N): " enable_ai
+  use_ai=0
+  ai_host=""
+  ai_model=""
+  if [[ "$enable_ai" =~ ^[Yy]$ ]]; then
+    use_ai=1
+    read -rp "🌐 AI host URL [default: http://localhost:11434]: " ai_host
+    read -rp "🧠 AI model [default: gemma3:latest]: " ai_model
+    ai_host="${ai_host:-http://localhost:11434}"
+    ai_model="${ai_model:-gemma3:latest}"
+  fi
+
+  USE_AI=$use_ai
+  AI_HOST="$ai_host"
+  AI_MODEL="$ai_model"
+
+  echo "✅ Configuration saved"
+}
+
+installHook() {
+  local git_root
+  local script_dir
+
+  script_dir="$(dirname "$(realpath "$0")")"
+  git_root="$(git rev-parse --show-toplevel)"
+
+  script_path="$script_dir/$MAIN_SCRIPT"
+  crafted_args=("-m" "git" "-t" "$git_root")
+  if [[ "$USE_AI" -eq 1 ]]; then
+    crafted_args+=("--ai" "--aih" "$AI_HOST" "--aim" "$AI_MODEL")
+  fi
+
+  echo "CRAFTED PRE-PUSH HOOK: $script_path ${crafted_args[*]}"
+
+  cat <<EOF >"$git_root/.git/hooks/$PRE_PUSH_FILE"
+#!/bin/bash
+
+# Redirect input/output to /dev/tty to ensure user interaction
+exec < /dev/tty
+exec > /dev/tty 2>&1
+
+$script_path ${crafted_args[@]}
+status=\$?
+
+if [[ \$status -ne 0 ]]; then
+  echo "🚨 Nuclei SAST detected issues in your codebase."
+  read -rp "📄 Check the report before pushing? (y/n): " check_report
+  if [[ "\$check_report" =~ ^[Yy]$ ]]; then
+    if command -v less &>/dev/null; then
+      less sast-report.txt
+    else
+      cat sast-report.txt
+    fi
+  fi
+
+  read -rp "❓ Proceed with push anyway? (y/n): " proceed
+  if [[ ! "\$proceed" =~ ^[Yy]$ ]]; then
+    echo "❌ Push aborted."
+    exit 1
+  else
+    echo "⚠️ Push continued despite issues."
+  fi
+fi
+EOF
+
+  chmod +x "$git_root/.git/hooks/$PRE_PUSH_FILE"
+  echo "✅ Git hook installed at: $git_root/.git/hooks/$PRE_PUSH_FILE"
+}
+
+main() {
+  USE_AI=0
+  AI_HOST=""
+  AI_MODEL=""
+
+  checkDependencies
+  interactiveConfig
+  installHook
+}
+
+main "$@"
