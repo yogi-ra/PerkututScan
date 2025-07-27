@@ -17,24 +17,24 @@ set -euo pipefail
 # shellcheck disable=SC2317
 # === Cleanup handler ===
 cleanup() {
-  [[ -f "$NUCLEI_OUTPUT_TMP" ]] && rm -f "$NUCLEI_OUTPUT_TMP" &>/dev/null
-  [[ -f "$NUCLEI_USEFUL_FILTER_TMP" ]] && rm -f "$NUCLEI_USEFUL_FILTER_TMP" &>/dev/null
   [[ -f "$AI_USER_PROMPT" ]] && rm -f "$AI_USER_PROMPT" &>/dev/null
   [[ -f "$AI_RESPONSE_TMPFILE" ]] && rm -f "$AI_RESPONSE_TMPFILE" &>/dev/null
-  if [[ "$MODE" == "git" ]]; then
-    [[ -d "/tmp/$(basename "$TARGET")" ]] && rm -rf "/tmp/$(basename "$TARGET")" &>/dev/null
-  fi
+  [[ -d "$GIT_CLONED_TARGET" ]] && rm -rf "$GIT_CLONED_TARGET" &>/dev/null
+  [[ -f "$NUCLEI_OUTPUT_TMP" ]] && rm -f "$NUCLEI_OUTPUT_TMP" &>/dev/null
+  [[ -d "/tmp/$(basename "$TARGET")" ]] && rm -rf "/tmp/$(basename "$TARGET")" &>/dev/null
   find /tmp -type d -iname "nuclei*" -exec rm -rf {} \; &>/dev/null
 }
-trap cleanup INT TERM EXIT
+trap cleanup INT TERM
 
 print_help() {
   echo "Usage: $0 [-m MODE] [-t TARGET] [--ai] [--aih URL] [--aim MODEL] [-h]"
   echo "  -m      Scan mode (dir, git)"
   echo "  -t      Target directory or repo"
   echo "  --ai    Enable AI"
-  echo "  --aih   AI URL (default: http://localhost:11434)"
-  echo "  --aim   AI model (default: gemma3:latest)"
+  echo "  --aih   AI URL (default: $AI_URL)"
+  echo "  --aim   AI Model (default: $AI_MODEL)"
+  echo "  --aib   n Findings for AI to score in a batch (default: $AI_BATCH_SIZE)"
+  echo "  --aik   AI API Key (default: $AI_API_KEY)"
   echo "  -h      Show help"
 }
 
@@ -42,53 +42,27 @@ print_git_help() {
   echo "Git mode help:"
   echo "  -m git -t <repo/git project dir path/current directory(leave blank)>    Scan git project"
   echo "  --ai    Enable AI"
-  echo "  --aih   AI URL (default: http://localhost:11434)"
-  echo "  --aim   AI model (default: gemma3:latest)"
+  echo "  --aih   AI URL (default: $AI_URL)"
+  echo "  --aim   AI Model (default: $AI_MODEL)"
+  echo "  --aib   n Findings for AI to score in a batch (default: $AI_BATCH_SIZE)"
+  echo "  --aik   AI API Key (default: $AI_API_KEY)"
 }
 
 print_dir_help() {
   echo "Dir mode help:"
   echo "  -m dir -t <path>    Scan directory"
   echo "  --ai    Enable AI"
-  echo "  --aih   AI URL (default: http://localhost:11434)"
-  echo "  --aim   AI model (default: gemma3:latest)"
-}
-
-# === Dependency check ===
-checkDependencies() {
-  # These are dependencies that are possibly not available on minimal systems.
-  local dependencies=(file nuclei rsync jq curl)
-
-  for dep in "${dependencies[@]}"; do
-    if ! command -v "$dep" &>/dev/null; then
-      echo "❌ Missing dependency: $dep"
-      exit 1
-    fi
-  done
-}
-
-git_exclude_script() {
-  local project_path="$TARGET/.git/info"
-  if test -f "$project_path/exclude.bak"; then
-    mv "$project_path/exclude.bak" "$project_path/exclude"
-  else
-    test -f "$project_path/exclude" || cp "$project_path/exclude" "$project_path/exclude.bak"
-  fi
-}
-
-ignoreSASTFile() {
-  local the_file="$1"
-  if ! grep -q "$the_file" "$TARGET/.git/info/exclude" 2>/dev/null; then
-    echo "$the_file" >>"$TARGET/.git/info/exclude"
-    echo "📁 Added $the_file to $TARGET/.git/info/exclude"
-  fi
+  echo "  --aih   AI URL (default: $AI_URL)"
+  echo "  --aim   AI Model (default: $AI_MODEL)"
+  echo "  --aib   n Findings for AI to score in a batch (default: $AI_BATCH_SIZE)"
+  echo "  --aik   AI API Key (default: $AI_API_KEY)"
 }
 
 # === Report generator ===
 generateReport() {
   local nuclei_findings_file="$1"
   local ai_analysis_file="$2"
-  local final_findings_json
+  local final_findings_json=""
 
   if [[ ! -s "$nuclei_findings_file" ]]; then
     echo -e "\n✅ No vulnerabilities found by Nuclei." | tee "$NUCLEI_REPORT_FILE"
@@ -98,31 +72,52 @@ generateReport() {
   # === AI-Enhanced Reporting ===
   if [[ -n "$ai_analysis_file" && -s "$ai_analysis_file" ]]; then
     echo -e "\n🤖 Filtering and enhancing report with AI analysis..."
+
+    {
+      output_add_full_line_tmp=$(mktemp)
+      add_full_line_match "$ai_analysis_file" >"$output_add_full_line_tmp" 2>/dev/null
+      mv "$output_add_full_line_tmp" "$ai_analysis_file"
+    } &
+    spinner_run "$!" "Adding full-line match(es) to findings..."
+
+    {
+      strip_tmp_matched_at_tmp=$(mktemp)
+      strip_tmp_from_matched_at "$ai_analysis_file" >"$strip_tmp_matched_at_tmp"
+      mv "$strip_tmp_matched_at_tmp" "$ai_analysis_file"
+    } &
+    spinner_run "$!" "Stripping /tmp/ from matched-at paths..."
+
     # Merge Nuclei and AI results. Filter out false positives (accuracy: 0).
     # Update severity and add reasoning from AI.
     final_findings_json=$(jq -s '
-  .[0] as $nuclei_findings | .[1] as $ai_analysis |
-  ($ai_analysis | map({
-    ((.["template-id"] + "|" + .["matched-at"] + "|" + (.["extracted-results"] | tostring))): .
-  }) | add) as $ai_map |
-  $nuclei_findings | map(
-    . as $finding |
-    ($finding["template-id"] + "|" + $finding["matched-at"] + "|" + ($finding["extracted-results"] | tostring)) as $key |
-    $ai_map[$key] as $ai_finding |
-    . + {
-      "info": {
-        "accuracy": ($ai_finding.accuracy // "N/A"),
-        "severity": ($ai_finding.severity // "unknown"),
-        "name": .info.name,
-        "description": .info.description,
-        "ai_reasoning": ($ai_finding.reasoning // "Not provided")
-      }
-    }
-  )
-  ' "$nuclei_findings_file" "$ai_analysis_file")
+      .[0] as $nuclei |
+      .[1] as $ai |
+
+      $nuclei | map(
+        . as $finding |
+        (
+          $ai
+          | map(select(
+              .["template-id"] == $finding["template-id"]
+              and ((.["extracted-results"] // []) | map(. as $item | $finding["extracted-results"] | index($item)) | any)
+            ))[0] // {}
+        ) as $ai_finding |
+
+        $finding + {
+          "full-matches": ($ai_finding["full-matches"] // []),
+          "info": {
+            "accuracy": ($ai_finding.accuracy // "N/A"),
+            "severity": ($ai_finding.severity // "unknown"),
+            "name": $finding.info.name,
+            "description": $finding.info.description,
+            "ai_reasoning": ($ai_finding.reasoning // "Not provided")
+          }
+        }
+      )
+    ' "$nuclei_findings_file" "$ai_analysis_file")
   else
     # === Standard reporting produced by Nuclei ===
-    echo -e "\n📄 Generating standard SAST report..."
+    echo -ne "\n📄 Generating standard SAST report..."
     final_findings_json=$(jq -s '.' <(jq '.[]' "$nuclei_findings_file"))
   fi
 
@@ -158,15 +153,54 @@ generateReport() {
     echo "$final_findings_json" | jq -r '
     .[] |
     ((.info.severity | if type == "string" then . else "UNKNOWN" end) | ascii_upcase) as $severity_text |
-    "\( $severity_text ): \(.info.name // "N/A")\n     DESCRIPTION        -> \(.info.description // "N/A")\n     MATCHED-AT         -> \(.["matched-at"] // "N/A")\n     MATCH-STRING       -> \((.["extracted-results"] // []) | join(", "))\n     FULL-MATCH-STRING  -> \(.["full-matches"] // "N/A")\n     ACCURACY           -> \(.info.accuracy // "N/A")\n" +
-     (if .info.ai_reasoning then "     AI REASONING       -> \(.info.ai_reasoning)" else "" end) + "\n"
+    "\( $severity_text ): " +
+    "\(.info.name // "N/A")\n" +
+    "     DESCRIPTION        -> \(.info.description // "N/A")\n" +
+    "     MATCHED-AT         -> \(.["matched-at"] // "N/A")\n" +
+    "     MATCH-STRING       -> \((.["extracted-results"] // []) | join(", "))\n" +
+    "     FULL-MATCH-STRING  -> \((.["full-matches"] // []) | join(", "))\n" +
+    (if .info.ai_reasoning then
+    "     ACCURACY           -> \(.info.accuracy // "N/A")\n" else "" end) +
+    (if .info.ai_reasoning then
+    "     AI REASONING       -> \(.info.ai_reasoning // "N/A")" else "" end) +
+    "\n"
   '
   } >>"$NUCLEI_REPORT_FILE"
 
-  echo -e "\n📦 SAST Report saved to: $NUCLEI_REPORT_FILE"
+  echo -e "\r📦 SAST Report saved to: $(realpath "$NUCLEI_REPORT_FILE")"
 
   if [[ "$critical" -gt 0 || "$high" -gt 0 ]]; then
     MAJOR_VULN_FOUND=1
+  fi
+}
+
+# === Dependency check ===
+checkDependencies() {
+  # These are dependencies that are possibly not available on minimal systems.
+  local dependencies=(file nuclei rsync jq curl)
+
+  for dep in "${dependencies[@]}"; do
+    if ! command -v "$dep" &>/dev/null; then
+      echo "❌ Missing dependency: $dep"
+      exit 1
+    fi
+  done
+}
+
+git_exclude_script() {
+  local project_path="$TARGET/.git/info"
+  if test -f "$project_path/exclude.bak"; then
+    mv "$project_path/exclude.bak" "$project_path/exclude"
+  else
+    test -f "$project_path/exclude" || cp "$project_path/exclude" "$project_path/exclude.bak"
+  fi
+}
+
+ignoreSASTFile() {
+  local the_file="$1"
+  if ! grep -q "$the_file" "$TARGET/.git/info/exclude" 2>/dev/null; then
+    echo "$the_file" >>"$TARGET/.git/info/exclude"
+    echo "📁 Added $the_file to $TARGET/.git/info/exclude"
   fi
 }
 
@@ -204,7 +238,8 @@ add_full_line_match() {
   updated_entries=()
 
   for entry in "${entries[@]}"; do
-    local file_path keyword_found
+    local file_path
+    local keyword_found
     file_path=$(jq -r '."matched-at"' <<<"$entry")
     [[ -f "$file_path" ]] || continue
     mapfile -t keywords < <(jq -r '."extracted-results"[]' <<<"$entry")
@@ -220,7 +255,7 @@ add_full_line_match() {
 
     local matches_json
     matches_json=$(printf '%s\n' "${full_lines[@]}" | jq -R . | jq -s .)
-    updated_entries+=("$(jq --argjson matches "$matches_json" '.info["full-matches"] = $matches' <<<"$entry")")
+    updated_entries+=("$(jq --argjson matches "$matches_json" '.["full-matches"] = $matches' <<<"$entry")")
   done
   printf '[%s]\n' "$(
     IFS=,
@@ -228,21 +263,16 @@ add_full_line_match() {
   )"
 }
 
-ai_scoring_ollama() {
+ai_scoring() {
   local nuclei_output_file="$1"
   local ai_url="$2"
   local ai_model="$3"
-  local curl_pid
-  local prompt_pid
   local output_file="$4" # File to save final JSON to
+  local url
+  local curl_pid
+  local batch_ai_response
 
-  # === Default Batch Size (A batch equal to 1 finding) ===
-  local BATCH_SIZE=10
-
-  local AI_USER_PROMPT AI_RESPONSE_TMPFILE SYSTEM_PROMPT url
   AI_USER_PROMPT="$(mktemp)"
-  AI_RESPONSE_TMPFILE="$(mktemp)"
-
   SYSTEM_PROMPT=$(
     cat <<EOF
 You are a specialized SAST analysis bot. Your ONLY function is to analyze JSON data of security findings and return a JSON array as a response.
@@ -260,91 +290,96 @@ EOF
   )
 
   {
-    local NUCLEI_USEFUL_FILTER_TMP
-    NUCLEI_USEFUL_FILTER_TMP=$(mktemp)
-    filter_useful_nuclei_data "$nuclei_output_file" >"$NUCLEI_USEFUL_FILTER_TMP"
-    if [[ -s "$NUCLEI_USEFUL_FILTER_TMP" ]]; then
-      add_full_line_match "$NUCLEI_USEFUL_FILTER_TMP" >"$AI_USER_PROMPT" 2>/dev/null
-    else
-      echo "[]" >"$AI_USER_PROMPT"
-    fi
-    rm -f "$NUCLEI_USEFUL_FILTER_TMP"
-  } &
-  prompt_pid=$!
-  spinner_run "$prompt_pid" "Preparing user prompt..."
+    nuclei_useful_filter_tmp=$(mktemp)
+    filter_useful_nuclei_data "$nuclei_output_file" >"$nuclei_useful_filter_tmp"
+    mv "$nuclei_useful_filter_tmp" "$AI_USER_PROMPT"
 
-  wait "$prompt_pid"
+    added_full_line_tmp=$(mktemp)
+    add_full_line_match "$AI_USER_PROMPT" >"$added_full_line_tmp"
+    if [[ -s "$added_full_line_tmp" ]]; then
+      mv "$added_full_line_tmp" "$AI_USER_PROMPT"
+    else
+      rm -f "$added_full_line_tmp"
+    fi
+  } &
+  spinner_run "$!" "Preparing user prompt..."
 
   if [[ ! -s "$AI_USER_PROMPT" || "$(jq 'length' "$AI_USER_PROMPT")" -eq 0 ]]; then
     echo "[]" >"$output_file"
-    echo "No findings to send to AI. Skipping."
+    echo -e "\nNo findings to send to AI. Skipping."
     return
   fi
 
   # === Batch processing starts here ===
-  local total_findings
+  local total_findings=""
   total_findings=$(jq 'length' "$AI_USER_PROMPT")
-  local num_batches
-  num_batches=$(((total_findings + BATCH_SIZE - 1) / BATCH_SIZE))
+  local num_batches=""
+  num_batches=$(((total_findings + AI_BATCH_SIZE - 1) / AI_BATCH_SIZE))
 
-  echo -e "\nTotal findings to analyze: $total_findings. Splitting into $num_batches batches of size $BATCH_SIZE."
+  echo -e "\rTotal findings to analyze: $total_findings. Splitting into $num_batches batches of size $AI_BATCH_SIZE."
 
   local all_ai_results_tmp
   all_ai_results_tmp=$(mktemp)
   echo "[]" >"$all_ai_results_tmp"
 
-  url="$ai_url/api/generate"
+  url="$ai_url/chat/completions"
 
   for ((i = 0; i < num_batches; i++)); do
     local batch_num=$((i + 1))
     local batch_prompt_file
+
     batch_prompt_file=$(mktemp)
 
-    jq --argjson i "$i" --argjson size "$BATCH_SIZE" '.[($i * $size):($i * $size + $size)]' "$AI_USER_PROMPT" >"$batch_prompt_file"
+    jq --argjson i "$i" --argjson size "$AI_BATCH_SIZE" '.[($i * $size):($i * $size + $size)]' "$AI_USER_PROMPT" >"$batch_prompt_file"
 
     if [[ ! -s "$batch_prompt_file" ]]; then
       rm -f "$batch_prompt_file"
       continue
     fi
 
+    batch_ai_response="$(mktemp)"
     {
-      local temp_json_file
       temp_json_file=$(mktemp)
 
       jq -n --arg model "$ai_model" \
         --arg system "$SYSTEM_PROMPT" \
         --rawfile prompt "$batch_prompt_file" \
-        '{model: $model, system: $system, prompt: $prompt, stream: false}' >"$temp_json_file"
+        '{
+          model: $model,
+          messages: [
+            {"role": "system", "content": $system},
+            {"role": "user", "content": $prompt}
+          ], stream: false
+        }' >"$temp_json_file"
 
-      curl -s -X POST "$url" -H "Content-Type: application/json" -d @"$temp_json_file" >"$AI_RESPONSE_TMPFILE"
+      curl -s -X POST "$url" -H "Authorization: Bearer $AI_API_KEY" -H "Content-Type: application/json" -d @"$temp_json_file" >"$batch_ai_response"
       rm -f "$temp_json_file" "$batch_prompt_file"
     } &
+
     curl_pid=$!
     spinner_run "$curl_pid" "🤖 Running AI Scoring (Batch $batch_num of $num_batches)..."
-    echo -ne "\r\033[K" # Clear spinner line
-
-    wait "$curl_pid"
+    echo -ne "\r\033[K"
 
     # Process the AI response for current batch
-    if [[ ! -s "$AI_RESPONSE_TMPFILE" ]]; then
+    if [[ ! -s "$batch_ai_response" ]]; then
       echo "❌ AI did not return a response for batch $batch_num." >&2
       continue
     fi
 
-    local ai_raw_text_response
-    ai_raw_text_response=$(jq -r '.response' "$AI_RESPONSE_TMPFILE")
+    local ai_raw_text_response=""
+    ai_raw_text_response=$(jq -r '.choices[0].message.content' "$batch_ai_response")
     if [[ -z "$ai_raw_text_response" || "$ai_raw_text_response" == "null" ]]; then
       echo "❌ AI response content is empty for batch $batch_num." >&2
-      if jq -e '.error' "$AI_RESPONSE_TMPFILE" >/dev/null; then
-        echo "Ollama returned an error: $(jq -r '.error' "$AI_RESPONSE_TMPFILE")" >&2
+      if jq -e '.error' "$batch_ai_response" >/dev/null; then
+        echo "AI returned an error: $(jq -r '.error' "$batch_ai_response")" >&2
       fi
       continue
     fi
 
-    local cleaned_response
+    local cleaned_response=""
     cleaned_response=$(echo "$ai_raw_text_response" | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//')
 
-    local batch_json_result
+    local batch_json_result=""
     batch_json_result=$(naive_ai_text_response_to_json "$cleaned_response")
 
     # Combine the current batch result with the accumulated results
@@ -352,7 +387,7 @@ EOF
     if echo "$batch_json_result" | jq -e . >/dev/null 2>&1; then
       # If valid, append to the temporary file
       if [[ $(echo "$batch_json_result" | jq 'length') -gt 0 ]]; then
-        local combined_results
+        local combined_results=""
         combined_results=$(jq -s '.[0] + .[1]' "$all_ai_results_tmp" <(echo "$batch_json_result"))
         echo "$combined_results" >"$all_ai_results_tmp"
       fi
@@ -360,27 +395,52 @@ EOF
     # Skipping if invalid.
   done
 
-  # Copy the final results to the output file
-  cp "$all_ai_results_tmp" "$output_file"
-  rm -f "$all_ai_results_tmp" "$AI_USER_PROMPT"
+  rm -f "$batch_ai_response"
+  mv "$all_ai_results_tmp" "$output_file"
   echo -e "\n✅ AI analysis complete. All batches processed."
+}
+
+strip_tmp_from_matched_at() {
+  local input_file="$1"
+  if [[ "$GIT_TARGET_TYPE" -ne 2 ]]; then
+    jq --arg target "$(realpath "$TARGET")" \
+      '
+      map(
+        .["matched-at"] |= (
+          match("^/tmp/[^/]+(/.*)?")
+          | $target + (.captures[0].string // "")
+        )
+      )
+    ' "$input_file"
+  else
+    jq \
+      '
+      map(
+        .["matched-at"] |= (
+          match("^/tmp/[^/]+/[^/]+(/.*)?")
+          | (.captures[0].string // "")
+        )
+      )
+    ' "$input_file"
+  fi
 }
 
 run_prepare() {
   local source="$1"
-  local temp_root="/tmp"
-  local clean_target=""
+  local clean_target
 
-  clean_target="$temp_root/$(basename "$source")"
+  clean_target="/tmp/$(basename "$TARGET")"
 
-  rsync -a "$source" "$temp_root" \
-    --exclude=".git" \
-    --exclude=".github" \
+  rsync -a "$source/" "$clean_target" \
+    --exclude=".git*" \
+    --exclude=".github*" \
     --exclude=".svn" \
     --exclude=".hg" \
     --exclude=".bzr" \
     --exclude=".vscode" \
     --exclude=".idea" \
+    --exclude="Dockerfile*" \
+    --exclude="Jenkinsfile*" \
     --exclude="node_modules" \
     --exclude="dist" \
     --exclude="build" \
@@ -415,59 +475,10 @@ run_prepare() {
     --exclude="*.test.*" \
     --exclude="*.spec.*" \
     --exclude="*.mock.*" \
+    --exclude="sast-report.txt" \
     &>/dev/null
 
   echo "$clean_target"
-}
-
-git_mode_run() {
-  local real_target=""
-  local original_target=""
-
-  if [[ "$GIT_TARGET_TYPE" -eq 0 ]]; then
-    original_target="$(git rev-parse --show-toplevel)"
-    real_target=$(run_prepare "$original_target")
-  elif [[ "$GIT_TARGET_TYPE" -eq 1 ]]; then
-    original_target="$(cd "$TARGET" && git rev-parse --show-toplevel)"
-    real_target=$(run_prepare "$original_target")
-  elif [[ "$GIT_TARGET_TYPE" -eq 2 ]]; then
-    TARGET_CLONE_DIR=$(mktemp -d "/tmp/$(basename "$TARGET" .git).XXXXXX")
-    git clone --depth 1 "$TARGET" "$TARGET_CLONE_DIR" &>/dev/null
-    real_target=$(run_prepare "$TARGET_CLONE_DIR")
-  else
-    exit 1
-  fi
-
-  git_exclude_script
-  ignoreSASTFile "$NUCLEI_SAST_REPORT_FILE"
-
-  NUCLEI_OUTPUT_TMP=$(mktemp)
-  NUCLEI_REPORT_FILE="$original_target/$NUCLEI_SAST_REPORT_FILE"
-
-  {
-    nuclei -file -u "$real_target" \
-      -s "info,low,medium,high,critical,unknown" \
-      -ud "$NUCLEI_TEMPLATE_DIR" \
-      -je "$NUCLEI_OUTPUT_TMP" &>/dev/null
-  } &
-  NUCLEI_PID=$!
-}
-
-dir_mode_run() {
-  local target="$TARGET"
-  local real_target
-
-  real_target=$(run_prepare "$target")
-
-  NUCLEI_OUTPUT_TMP=$(mktemp)
-  NUCLEI_REPORT_FILE="$target/$NUCLEI_SAST_REPORT_FILE"
-  {
-    nuclei -file -u "$real_target" \
-      -s "info,low,medium,high,critical,unknown" \
-      -ud "$NUCLEI_TEMPLATE_DIR" \
-      -je "$NUCLEI_OUTPUT_TMP" &>/dev/null
-  } &
-  NUCLEI_PID=$!
 }
 
 print_full_width_spaces() {
@@ -498,7 +509,7 @@ spinner_run() {
 parse_args() {
   local opts
 
-  if ! opts=$(getopt -o m:t:h --long ai,aih:,aim: -- "$@"); then
+  if ! opts=$(getopt -o m:t:h --long ai,aih:,aim:,aib:,aik: -- "$@" 2>/dev/null); then
     echo "❌ Invalid options"
     print_help
     exit 1
@@ -528,9 +539,17 @@ parse_args() {
       AI_MODEL="$2"
       shift 2
       ;;
+    --aib)
+      AI_BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --aik)
+      AI_API_KEY="$2"
+      shift 2
+      ;;
     -h)
-      print_help
-      exit 0
+      SHOW_HELP=1
+      shift
       ;;
     --)
       shift
@@ -544,26 +563,87 @@ parse_args() {
   done
 }
 
-# === Main Logic ===
+git_mode_run() {
+  local real_target=""
+  local original_target="$PWD"
+
+  if [[ "$GIT_TARGET_TYPE" -eq 0 ]]; then
+    original_target="$(git rev-parse --show-toplevel)"
+    real_target=$(run_prepare "$original_target")
+  elif [[ "$GIT_TARGET_TYPE" -eq 1 ]]; then
+    original_target="$(cd "$TARGET" && git rev-parse --show-toplevel)"
+    real_target=$(run_prepare "$original_target")
+  elif [[ "$GIT_TARGET_TYPE" -eq 2 ]]; then
+    GIT_CLONED_TARGET="$(mktemp -d "/tmp/$(basename "$TARGET").XXXXXX")"
+
+    git clone --depth 1 "$TARGET" "$GIT_CLONED_TARGET" &>/dev/null &
+    spinner_run "$!" "Cloning git repository..."
+
+    TARGET=$(cut -d. -f1 < <(echo "$GIT_CLONED_TARGET"))
+    real_target=$(run_prepare "$GIT_CLONED_TARGET")
+  else
+    exit 1
+  fi
+
+  if [[ "$GIT_TARGET_TYPE" -ne 2 ]]; then
+    git_exclude_script
+    ignoreSASTFile "$NUCLEI_SAST_REPORT_FILE"
+  fi
+
+  NUCLEI_OUTPUT_TMP=$(mktemp)
+  NUCLEI_REPORT_FILE="$original_target/$NUCLEI_SAST_REPORT_FILE"
+
+  {
+    nuclei -file -u "$real_target" \
+      -s "info,low,medium,high,critical,unknown" \
+      -ud "$NUCLEI_TEMPLATE_DIR" \
+      -je "$NUCLEI_OUTPUT_TMP" &>/dev/null
+  } &
+  NUCLEI_PID=$!
+}
+
+dir_mode_run() {
+  local target="$TARGET"
+  local real_target=""
+
+  real_target=$(run_prepare "$target")
+
+  NUCLEI_OUTPUT_TMP=$(mktemp)
+  NUCLEI_REPORT_FILE="$target/$NUCLEI_SAST_REPORT_FILE"
+  {
+    nuclei -file -u "$real_target" \
+      -s "info,low,medium,high,critical,unknown" \
+      -ud "$NUCLEI_TEMPLATE_DIR" \
+      -je "$NUCLEI_OUTPUT_TMP" &>/dev/null
+  } &
+
+  NUCLEI_PID=$!
+
+}
+
 main() {
-  AI_URL="http://localhost:11434"
+  # Default configurable variables
+  AI_URL="http://localhost:11434/v1"
   AI_MODEL="gemma3:latest"
+  AI_API_KEY="ollama"
+  AI_BATCH_SIZE=5
+
   AI_USER_PROMPT=""
   AI_RESPONSE_TMPFILE=""
+  GIT_TARGET_TYPE=-1   # Type 0: Current Directory, 1: Specified Directory, 2: Git Repo URL
+  GIT_CLONED_TARGET="" # For git Type 2
   MODE=""
   MAJOR_VULN_FOUND=0
   NUCLEI_PID=""
   NUCLEI_REPORT_FILE=""
   NUCLEI_OUTPUT_TMP=""
-  NUCLEI_USEFUL_FILTER_TMP=""
-  NUCLEI_SAST_REPORT_FILE="sast_report.txt"
+  NUCLEI_SAST_REPORT_FILE="sast-report.txt"
   SHOW_HELP=0
   TARGET=""
   USE_AI=0
 
   parse_args "$@"
 
-  # print the help if -h option provided
   if [[ $SHOW_HELP -eq 1 ]]; then
     case "$MODE" in
     git)
@@ -625,27 +705,47 @@ main() {
     exit 1
   fi
 
-  echo "🔍 Executing automated SAST with Nuclei..."
+  echo -e "\r🔍 Executing automated SAST with Nuclei..."
 
   spinner_run "$NUCLEI_PID"
-
-  wait "$NUCLEI_PID" || true
 
   if [[ $USE_AI -eq 1 ]]; then
     if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
       AI_RESPONSE_TMPFILE=$(mktemp)
-      ai_scoring_ollama "$NUCLEI_OUTPUT_TMP" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
+      ai_scoring "$NUCLEI_OUTPUT_TMP" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
     else
       echo "✅ No findings from Nuclei, skipping AI analysis."
     fi
+  else
+    {
+      output_add_full_line_tmp=$(mktemp)
+      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$output_add_full_line_tmp" 2>/dev/null
+      mv "$output_add_full_line_tmp" "$NUCLEI_OUTPUT_TMP"
+    } &
+    spinner_run "$!" "Adding full-line match(es) to findings..."
+
+    {
+      current_nuclei_output_tmp=$(mktemp)
+      strip_tmp_from_matched_at "$NUCLEI_OUTPUT_TMP" >"$current_nuclei_output_tmp"
+      mv "$current_nuclei_output_tmp" "$NUCLEI_OUTPUT_TMP"
+    } &
+    spinner_run "$!" "Stripping /tmp/ from matched-at paths..."
   fi
 
   generateReport "$NUCLEI_OUTPUT_TMP" "$AI_RESPONSE_TMPFILE"
 
-  git_exclude_script
+  if [[ "$MODE" == "dir" && "$GIT_TARGET_TYPE" -ne 2 ]]; then
+    git_exclude_script
+  fi
+
+  cleanup
 
   # If High/Critical vulnerabilities found, exit 1, else exit 0
-  exit "$MAJOR_VULN_FOUND"
+  if [[ "$MAJOR_VULN_FOUND" -eq 1 ]]; then
+    exit 1
+  else
+    exit 0
+  fi
 }
 
 main "$@"
