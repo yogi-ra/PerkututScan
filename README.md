@@ -79,11 +79,11 @@ After the scan, a detailed report named `sast-report.txt` will be generated in t
 
 To automatically scan your code every time you push to your repository, you can use the interactive setup script.
 
-1.  Make sure the `perkutut-scan` and `perkutut-init` scripts are in the same directory.
+1.  Make sure the `perkutut-scan` and `perkutut-scan-init` scripts are in the same directory.
 2.  Navigate to your local Git repository's directory.
 3.  Run the initialization script from within your repository's directory:
     ```bash
-    /path/to/scripts/perkutut-init
+    /path/to/scripts/perkutut-scan-init
     ```
 4.  Follow the interactive prompts to enable AI analysis and confirm the settings.
 
