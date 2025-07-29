@@ -30,19 +30,32 @@ interactiveConfig() {
 
   read -rp "🤖 Enable AI analysis? (y/N): " enable_ai
   use_ai=0
-  ai_host=""
-  ai_model=""
+  ai_host="http://localhost:11434/v1"
+  ai_model="gemma3:latest"
+  ai_batch_size="5"
+  ai_api_key="ollama"
+
   if [[ "$enable_ai" =~ ^[Yy]$ ]]; then
     use_ai=1
-    read -rp "🌐 AI host URL [default: http://localhost:11434]: " ai_host
-    read -rp "🧠 AI model [default: gemma3:latest]: " ai_model
-    ai_host="${ai_host:-http://localhost:11434}"
-    ai_model="${ai_model:-gemma3:latest}"
+
+    read -rp "🌐 AI host URL [default: $ai_host]: " input
+    [[ -n "$input" ]] && ai_host="$input"
+
+    read -rp "🧠 AI model [default: $ai_model]: " input
+    [[ -n "$input" ]] && ai_model="$input"
+
+    read -rp "📦 AI batch size [default: $ai_batch_size]: " input
+    [[ -n "$input" ]] && ai_batch_size="$input"
+
+    read -rp "🔑 AI API key if required [default: $ai_api_key]: " input
+    [[ -n "$input" ]] && ai_api_key="$input"
   fi
 
   USE_AI=$use_ai
   AI_HOST="$ai_host"
   AI_MODEL="$ai_model"
+  AI_BATCH_SIZE="$ai_batch_size"
+  AI_API_KEY="$ai_api_key"
 
   echo "✅ Configuration saved"
 }
@@ -56,8 +69,13 @@ installHook() {
 
   script_path="$script_dir/$MAIN_SCRIPT"
   crafted_args=("-m" "git" "-t" "$git_root")
+
   if [[ "$USE_AI" -eq 1 ]]; then
-    crafted_args+=("--ai" "--aih" "$AI_HOST" "--aim" "$AI_MODEL")
+    crafted_args+=("--ai")
+    [[ -n "$AI_HOST" ]] && crafted_args+=("--aih" "$AI_HOST")
+    [[ -n "$AI_MODEL" ]] && crafted_args+=("--aim" "$AI_MODEL")
+    [[ -n "$AI_BATCH_SIZE" ]] && crafted_args+=("--aib" "$AI_BATCH_SIZE")
+    [[ -n "$AI_API_KEY" ]] && crafted_args+=("--aik" "$AI_API_KEY")
   fi
 
   echo "CRAFTED PRE-PUSH HOOK: $script_path ${crafted_args[*]}"
@@ -83,7 +101,7 @@ if [[ \$status -ne 0 ]]; then
     fi
   fi
 
-  read -rp "❓ Proceed with push anyway? (y/n): " proceed
+  read -rp "❓ Proceed with push anyway? (y/N): " proceed
   if [[ ! "\$proceed" =~ ^[Yy]$ ]]; then
     echo "❌ Push aborted."
     exit 1
@@ -101,6 +119,8 @@ main() {
   USE_AI=0
   AI_HOST=""
   AI_MODEL=""
+  AI_BATCH_SIZE=""
+  AI_API_KEY=""
 
   checkDependencies
   interactiveConfig
