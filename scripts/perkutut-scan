@@ -199,9 +199,11 @@ git_exclude_script() {
 
 ignoreSASTFile() {
   local the_file="$1"
-  if ! grep -q "$the_file" "$TARGET/.git/info/exclude" 2>/dev/null; then
-    echo "$the_file" >>"$TARGET/.git/info/exclude"
-    echo "📁 Added $the_file to $TARGET/.git/info/exclude"
+  local exclude_file
+  exclude_file="$(git rev-parse --show-toplevel)/.git/info/exclude"
+  if ! grep -q "$the_file" "$exclude_file" 2>/dev/null; then
+    echo "$the_file" >>"$exclude_file"
+    echo "📁 Added $the_file to $exclude_file"
   fi
 }
 
@@ -668,6 +670,7 @@ main() {
   if [[ "$MODE" == "git" ]]; then
     if [[ -z "$TARGET" ]] && git status &>/dev/null; then
       GIT_TARGET_TYPE=0
+      TARGET=$(git rev-parse --show-toplevel)
     elif [[ -d "$TARGET" ]] && git -C "$TARGET" status &>/dev/null; then
       GIT_TARGET_TYPE=1
       TARGET=$(realpath "$TARGET")
