@@ -188,11 +188,12 @@ checkDependencies() {
 }
 
 git_exclude_script() {
-  local project_path="$TARGET/.git/info"
+  local project_path
+  project_path="$(git rev-parse --show-toplevel)/.git/info"
   if test -f "$project_path/exclude.bak"; then
     mv "$project_path/exclude.bak" "$project_path/exclude"
-  else
-    test -f "$project_path/exclude" || cp "$project_path/exclude" "$project_path/exclude.bak"
+  elif test -f "$project_path/exclude"; then
+    cp "$project_path/exclude" "$project_path/exclude.bak"
   fi
 }
 
@@ -734,7 +735,7 @@ main() {
 
   generateReport "$NUCLEI_OUTPUT_TMP" "$AI_RESPONSE_TMPFILE"
 
-  if [[ "$MODE" == "dir" && "$GIT_TARGET_TYPE" -ne 2 ]]; then
+  if [[ "$MODE" == "git" && "$GIT_TARGET_TYPE" -ne 2 ]]; then
     git_exclude_script
   fi
 
