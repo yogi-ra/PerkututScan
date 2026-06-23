@@ -10,10 +10,11 @@ The system uses Nuclei with custom configurations for static analysis, Regex for
 
 ## Features
 
-  * **AI-Enhanced Reporting**: Each finding is enriched with AI-generated explanations, risk context, and mitigation advice, helping developers understand the core problem.
+  * **AI-Enhanced Reporting**: Each finding is enriched with AI-generated explanations, risk context, mitigation advice, and full-match-string context (showing the exact line of code where the vulnerability was found), helping developers understand the core problem.
   * **Highly Portable**: As a Bash script, it runs on any Unix/Linux-based system without complex dependencies or configurations.
   * **Automated Vulnerability Categorization**: The tool automatically classifies vulnerabilities based on severity (Critical, High, Medium, Low, etc.) to help prioritize fixes.
   * **Git Integration**: Includes a Git pre-push hook that automatically scans your code, preventing you from pushing code with high or critical vulnerabilities.
+  * **Security Scan Workflow**: Optionally run additional security tools (Trivy, Bandit, Safety, Pip-Audit, Semgrep) via the `-s/--security-scan` flag for comprehensive vulnerability assessment.
 
 -----
 
@@ -27,6 +28,13 @@ Before you begin, you need to install a few dependencies.
 4.  **CURL**: A tool to transfer data from or to a server.
 5.  **Ollama (Optional)**: If you want run the AI model locally.
 
+**Optional dependencies for security-scan workflow** (enabled with `-s/--security-scan`):
+- **Docker**: Required for Trivy and Semgrep scans
+- **Bandit**: For Python security issues
+- **Safety**: For dependency vulnerability checking
+- **Pip-Audit**: For dependency vulnerability checking
+- **Semgrep**: For security audit (requires Docker)
+
 ## Usage
 
 ### Basic Scan
@@ -35,6 +43,7 @@ To perform a scan, use the `perkutut-scan` script with the following flags:
 
   * `-m`: Specifies the scan mode (`dir` for a local directory or `git` for a repository).
   * `-t`: Defines the target directory or repository URL.
+  * `-s, --security-scan`: Enable security-scan workflow (runs Trivy, Bandit, Safety, Pip-Audit, Semgrep).
   * `--ai`: Enables the AI analysis feature.
   * `--aih`: Sets a custom URL for the AI host (default: http://localhost:11434/v1).
   * `--aim`: Sets a custom AI model (default: gemma3:latest).

@@ -19,17 +19,22 @@ set -euo pipefail
 cleanup() {
   [[ -f "$AI_USER_PROMPT" ]] && rm -f "$AI_USER_PROMPT" &>/dev/null
   [[ -f "$AI_RESPONSE_TMPFILE" ]] && rm -f "$AI_RESPONSE_TMPFILE" &>/dev/null
+  [[ -f "$nuclei_with_full_tmp" ]] && rm -f "$nuclei_with_full_tmp" &>/dev/null
+  [[ -f "$nuclei_with_full_stripped_tmp" ]] && rm -f "$nuclei_with_full_stripped_tmp" &>/dev/null
   [[ -d "$GIT_CLONED_TARGET" ]] && rm -rf "$GIT_CLONED_TARGET" &>/dev/null
   [[ -f "$NUCLEI_OUTPUT_TMP" ]] && rm -f "$NUCLEI_OUTPUT_TMP" &>/dev/null
   [[ -d "/tmp/$(basename "$TARGET")" ]] && rm -rf "/tmp/$(basename "$TARGET")" &>/dev/null
   find /tmp -type d -iname "nuclei*" -exec rm -rf {} \; &>/dev/null
+  [[ -d "$SECURITY_SCAN_TEMP_DIR" ]] && rm -rf "$SECURITY_SCAN_TEMP_DIR" &>/dev/null
 }
 trap cleanup INT TERM
 
 print_help() {
-  echo "Usage: $0 [-m MODE] [-t TARGET] [--ai] [--aih URL] [--aim MODEL] [-h]"
+  echo "Usage: $0 [-m MODE] [-t TARGET] [-s] [--ai] [--aih URL] [--aim MODEL] [--aib N] [--aik KEY] [--tools LIST] [-h]"
   echo "  -m      Scan mode (dir, git)"
   echo "  -t      Target directory or repo"
+  echo "  -s, --security-scan   Enable security-scan workflow"
+  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,safety,pip-audit,semgrep)"
   echo "  --ai    Enable AI"
   echo "  --aih   AI URL (default: $AI_URL)"
   echo "  --aim   AI Model (default: $AI_MODEL)"
@@ -41,6 +46,8 @@ print_help() {
 print_git_help() {
   echo "Git mode help:"
   echo "  -m git -t <repo/git project dir path/current directory(leave blank)>    Scan git project"
+  echo "  -s, --security-scan   Enable security-scan workflow"
+  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,safety,pip-audit,semgrep)"
   echo "  --ai    Enable AI"
   echo "  --aih   AI URL (default: $AI_URL)"
   echo "  --aim   AI Model (default: $AI_MODEL)"
@@ -51,6 +58,8 @@ print_git_help() {
 print_dir_help() {
   echo "Dir mode help:"
   echo "  -m dir -t <path>    Scan directory"
+  echo "  -s, --security-scan   Enable security-scan workflow"
+  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,safety,pip-audit,semgrep)"
   echo "  --ai    Enable AI"
   echo "  --aih   AI URL (default: $AI_URL)"
   echo "  --aim   AI Model (default: $AI_MODEL)"
@@ -73,22 +82,9 @@ generateReport() {
   if [[ -n "$ai_analysis_file" && -s "$ai_analysis_file" ]]; then
     echo -e "\n🤖 Filtering and enhancing report with AI analysis..."
 
-    {
-      output_add_full_line_tmp=$(mktemp)
-      add_full_line_match "$ai_analysis_file" >"$output_add_full_line_tmp" 2>/dev/null
-      mv "$output_add_full_line_tmp" "$ai_analysis_file"
-    } &
-    spinner_run "$!" "Adding full-line match(es) to findings..."
-
-    {
-      strip_tmp_matched_at_tmp=$(mktemp)
-      strip_tmp_from_matched_at "$ai_analysis_file" >"$strip_tmp_matched_at_tmp"
-      mv "$strip_tmp_matched_at_tmp" "$ai_analysis_file"
-    } &
-    spinner_run "$!" "Stripping /tmp/ from matched-at paths..."
-
     # Merge Nuclei and AI results. Filter out false positives (accuracy: 0).
     # Update severity and add reasoning from AI.
+    # Prefer AI's full-matches, fall back to Nuclei's full-matches.
     final_findings_json=$(jq -s '
       .[0] as $nuclei |
       .[1] as $ai |
@@ -104,7 +100,7 @@ generateReport() {
         ) as $ai_finding |
 
         $finding + {
-          "full-matches": ($ai_finding["full-matches"] // []),
+          "full-matches": ($ai_finding["full-matches"] // $finding["full-matches"] // []),
           "info": {
             "accuracy": ($ai_finding.accuracy // "N/A"),
             "severity": ($ai_finding.severity // "unknown"),
@@ -118,7 +114,7 @@ generateReport() {
   else
     # === Standard reporting produced by Nuclei ===
     echo -ne "\n📄 Generating standard SAST report..."
-    final_findings_json=$(jq -s '.' <(jq '.[]' "$nuclei_findings_file"))
+    final_findings_json=$(jq -s '.' "$nuclei_findings_file")
   fi
 
   if [[ "$(echo "$final_findings_json" | jq 'length')" -eq 0 ]]; then
@@ -185,6 +181,55 @@ checkDependencies() {
       exit 1
     fi
   done
+}
+
+checkSecurityScanDependencies() {
+  # Check for dependencies needed for security-scan workflow
+  local docker_available=false
+  local bandit_available=false
+  local safety_available=false
+  local pip_audit_available=false
+  local missing_tools=()
+
+  # Check Docker (needed for Trivy and Semgrep)
+  if command -v docker >/dev/null 2>&1; then
+    docker_available=true
+  else
+    missing_tools+=("docker")
+  fi
+
+  # Check Bandit (for Python security issues)
+  if command -v bandit >/dev/null 2>&1; then
+    bandit_available=true
+  else
+    missing_tools+=("bandit")
+  fi
+
+  # Check Safety (for dependency vulnerability checking)
+  if command -v safety >/dev/null 2>&1; then
+    safety_available=true
+  else
+    missing_tools+=("safety")
+  fi
+
+  # Check Pip-Audit (for dependency vulnerability checking)
+  if command -v pip-audit >/dev/null 2>&1; then
+    pip_audit_available=true
+  else
+    missing_tools+=("pip-audit")
+  fi
+
+  # Store availability in global variables for use in tool functions
+  SECURITY_SCAN_DOCKER_AVAILABLE=$docker_available
+  SECURITY_SCAN_BANDIT_AVAILABLE=$bandit_available
+  SECURITY_SCAN_SAFETY_AVAILABLE=$safety_available
+  SECURITY_SCAN_PIP_AUDIT_AVAILABLE=$pip_audit_available
+
+  # Warn about missing tools but don't exit - we'll handle gracefully in each tool function
+  if [[ ${#missing_tools[@]} -gt 0 ]]; then
+    echo "⚠️  Warning: Missing security-scan dependencies: ${missing_tools[*]}"
+    echo "   Some security-scan tools may be skipped."
+  fi
 }
 
 git_exclude_script() {
@@ -512,7 +557,7 @@ spinner_run() {
 parse_args() {
   local opts
 
-  if ! opts=$(getopt -o m:t:h --long ai,aih:,aim:,aib:,aik: -- "$@" 2>/dev/null); then
+  if ! opts=$(getopt -o m:t:s:h --long ai,aih:,aim:,aib:,aik:,security-scan,tools: -- "$@" 2>/dev/null); then
     echo "❌ Invalid options"
     print_help
     exit 1
@@ -528,6 +573,14 @@ parse_args() {
       ;;
     -t)
       TARGET="$2"
+      shift 2
+      ;;
+    -s | --security-scan)
+      RUN_SECURITY_SCAN=1
+      shift
+      ;;
+    --tools)
+      SECURITY_SCAN_TOOLS="$2"
       shift 2
       ;;
     --ai)
@@ -566,16 +619,219 @@ parse_args() {
   done
 }
 
-git_mode_run() {
-  local real_target=""
-  local original_target="$PWD"
+# === Security-scan tool functions ===
 
+runTrivyScan() {
+  local source="$1"
+  local real_target="$2"
+  local temp_dir="$3"
+
+  if [[ "$SECURITY_SCAN_DOCKER_AVAILABLE" != "true" ]]; then
+    echo "⚠️  Skipping Trivy scan (Docker not available)"
+    return
+  fi
+
+  # Trivy Filesystem Scan
+  local trivy_output="${temp_dir}/trivy_filesystem.txt"
+  echo "🔍 Running Trivy Filesystem Scan..."
+  {
+    echo "## Trivy Filesystem Scan (Vulnerabilities & Secrets)"
+    echo ""
+    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format table"
+    echo ""
+    echo "Output:"
+    echo "$()$("
+    docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format table | tee "${trivy_output}"
+    echo ")$()"
+    echo ""
+  } >>"${temp_dir}/security-scan-report.md"
+
+  # Trivy RootFS Scan
+  local trivy_rootfs_output="${temp_dir}/trivy_rootfs.txt"
+  echo "🔍 Running Trivy RootFS Scan..."
+  {
+    echo "## Trivy RootFS Scan"
+    echo ""
+    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest rootfs /src"
+    echo ""
+    echo "Output:"
+    echo "$()$("
+    docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest rootfs /src 2>/dev/null || echo 'RootFS scan skipped (not applicable or requires root)' | tee "${trivy_rootfs_output}"
+    echo ")$()"
+    echo ""
+  } >>"${temp_dir}/security-scan-report.md"
+}
+
+runBanditScan() {
+  local source="$1"
+  local real_target="$2"
+  local temp_dir="$3"
+
+  if [[ "$SECURITY_SCAN_BANDIT_AVAILABLE" != "true" ]]; then
+    echo "⚠️  Skipping Bandit scan (bandit not available)"
+    return
+  fi
+
+  echo "🔍 Running Bandit Security Scan..."
+  {
+    echo "## Bandit Security Scan (Python-specific issues)"
+    echo ""
+    echo "Command: bandit -r \"${real_target}\" -lll --format txt"
+    echo ""
+    echo "Output:"
+    echo "$()$("
+    bandit -r "${real_target}" -lll --format txt | tee "${temp_dir}/bandit.txt"
+    echo ")$()"
+    echo ""
+  } >>"${temp_dir}/security-scan-report.md"
+}
+
+runSafetyScan() {
+  local source="$1"
+  local real_target="$2"
+  local temp_dir="$3"
+
+  if [[ "$SECURITY_SCAN_SAFETY_AVAILABLE" != "true" ]] || [[ ! -f "${real_target}/requirements.txt" ]]; then
+    if [[ ! -f "${real_target}/requirements.txt" ]]; then
+      echo "⚠️  Skipping Safety scan (requirements.txt not found)"
+    else
+      echo "⚠️  Skipping Safety scan (safety not available)"
+    fi
+    return
+  fi
+
+  echo "🔍 Running Safety Dependency Vulnerability Check..."
+  {
+    echo "## Safety Dependency Vulnerability Check"
+    echo ""
+    echo "Command: safety check -r \"${real_target}/requirements.txt\" --bare"
+    echo ""
+    echo "Output:"
+    echo "$()$("
+    safety check -r "${real_target}/requirements.txt" --bare | tee "${temp_dir}/safety.txt"
+    echo ")$()"
+    echo ""
+  } >>"${temp_dir}/security-scan-report.md"
+}
+
+runPipAuditScan() {
+  local source="$1"
+  local real_target="$2"
+  local temp_dir="$3"
+
+  if [[ "$SECURITY_SCAN_PIP_AUDIT_AVAILABLE" != "true" ]] || [[ ! -f "${real_target}/requirements.txt" ]]; then
+    if [[ ! -f "${real_target}/requirements.txt" ]]; then
+      echo "⚠️  Skipping Pip-Audit scan (requirements.txt not found)"
+    else
+      echo "⚠️  Skipping Pip-Audit scan (pip-audit not available)"
+    fi
+    return
+  fi
+
+  echo "🔍 Running Pip-Audit Dependency Vulnerability Check..."
+  {
+    echo "## Pip-Audit Dependency Vulnerability Check"
+    echo ""
+    echo "Command: pip-audit -r \"${real_target}/requirements.txt\" --format txt"
+    echo ""
+    echo "Output:"
+    echo "$()$("
+    pip-audit -r "${real_target}/requirements.txt" --format txt | tee "${temp_dir}/pip-audit.txt"
+    echo ")$()"
+    echo ""
+  } >>"${temp_dir}/security-scan-report.md"
+}
+
+runSemgrepScan() {
+  local source="$1"
+  local real_target="$2"
+  local temp_dir="$3"
+
+  if [[ "$SECURITY_SCAN_DOCKER_AVAILABLE" != "true" ]]; then
+    echo "⚠️  Skipping Semgrep scan (Docker not available)"
+    return
+  fi
+
+  echo "🔍 Running Semgrep Security Audit..."
+  {
+    echo "## Semgrep Security Audit (OWASP Top Ten & General Security)"
+    echo ""
+    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm --entrypoint semgrep semgrep/semgrep:latest --config p/security-audit --config p/owasp-top-ten /src"
+    echo ""
+    echo "Output:"
+    echo "$()$("
+    docker run -v "${real_target}:/src:ro" -i --rm --entrypoint semgrep semgrep/semgrep:latest --config p/security-audit --config p/owasp-top-ten /src | tee "${temp_dir}/semgrep.txt"
+    echo ")$()"
+    echo ""
+  } >>"${temp_dir}/security-scan-report.md"
+}
+
+runSecurityScanWorkflow() {
+  local source="$1"
+  local real_target="$2"
+
+  # Create temporary directory for security-scan outputs
+  SECURITY_SCAN_TEMP_DIR=$(mktemp -d)
+
+  # Initialize security-scan report
+  {
+    echo "# Security Scan Report"
+    echo "**Date:** $(date)"
+    echo "**Project:** $(basename "${real_target}")"
+    echo ""
+  } >"${SECURITY_SCAN_TEMP_DIR}/security-scan-report.md"
+
+  # Parse the tools to run (comma-separated list)
+  IFS=',' read -ra TOOLS_ARRAY <<<"$SECURITY_SCAN_TOOLS"
+
+  # Run selected tools
+  for tool in "${TOOLS_ARRAY[@]}"; do
+    case "$tool" in
+    trivy)
+      runTrivyScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
+      ;;
+    bandit)
+      runBanditScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
+      ;;
+    safety)
+      runSafetyScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
+      ;;
+    pip-audit)
+      runPipAuditScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
+      ;;
+    semgrep)
+      runSemgrepScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
+      ;;
+    *)
+      echo "⚠️  Unknown security-scan tool: $tool"
+      ;;
+    esac
+  done
+
+  # Return the path to the generated report
+  echo "${SECURITY_SCAN_TEMP_DIR}/security-scan-report.md"
+}
+
+generateSecurityScanReportSection() {
+  local security_scan_report_file="$1"
+  local main_report_file="$2"
+
+  if [[ ! -f "$security_scan_report_file" ]] || [[ ! -s "$security_scan_report_file" ]]; then
+    echo -e "\n⚠️  No security-scan results to include in report." >>"$main_report_file"
+    return
+  fi
+
+  echo -e "\n\n====== Security-scan Results (Generated: $(date)) =======" >>"$main_report_file"
+  cat "$security_scan_report_file" >>"$main_report_file"
+}
+
+git_mode_run() {
   if [[ "$GIT_TARGET_TYPE" -eq 0 ]]; then
-    original_target="$(git rev-parse --show-toplevel)"
-    real_target=$(run_prepare "$original_target")
+    local original_target="$(git rev-parse --show-toplevel)"
+    FILTERED_TARGET_PATH=$(run_prepare "$original_target")
   elif [[ "$GIT_TARGET_TYPE" -eq 1 ]]; then
-    original_target="$(cd "$TARGET" && git rev-parse --show-toplevel)"
-    real_target=$(run_prepare "$original_target")
+    local original_target="$(cd "$TARGET" && git rev-parse --show-toplevel)"
+    FILTERED_TARGET_PATH=$(run_prepare "$original_target")
   elif [[ "$GIT_TARGET_TYPE" -eq 2 ]]; then
     GIT_CLONED_TARGET="$(mktemp -d "/tmp/$(basename "$TARGET").XXXXXX")"
 
@@ -583,7 +839,7 @@ git_mode_run() {
     spinner_run "$!" "Cloning git repository..."
 
     TARGET=$(cut -d. -f1 < <(echo "$GIT_CLONED_TARGET"))
-    real_target=$(run_prepare "$GIT_CLONED_TARGET")
+    FILTERED_TARGET_PATH=$(run_prepare "$GIT_CLONED_TARGET")
   else
     exit 1
   fi
@@ -597,7 +853,7 @@ git_mode_run() {
   NUCLEI_REPORT_FILE="$original_target/$NUCLEI_SAST_REPORT_FILE"
 
   {
-    nuclei -file -u "$real_target" \
+    nuclei -file -u "$FILTERED_TARGET_PATH" \
       -s "info,low,medium,high,critical,unknown" \
       -ud "$NUCLEI_TEMPLATE_DIR" \
       -je "$NUCLEI_OUTPUT_TMP" &>/dev/null
@@ -606,15 +862,12 @@ git_mode_run() {
 }
 
 dir_mode_run() {
-  local target="$TARGET"
-  local real_target=""
-
-  real_target=$(run_prepare "$target")
+  FILTERED_TARGET_PATH=$(run_prepare "$TARGET")
 
   NUCLEI_OUTPUT_TMP=$(mktemp)
-  NUCLEI_REPORT_FILE="$target/$NUCLEI_SAST_REPORT_FILE"
+  NUCLEI_REPORT_FILE="$TARGET/$NUCLEI_SAST_REPORT_FILE"
   {
-    nuclei -file -u "$real_target" \
+    nuclei -file -u "$FILTERED_TARGET_PATH" \
       -s "info,low,medium,high,critical,unknown" \
       -ud "$NUCLEI_TEMPLATE_DIR" \
       -je "$NUCLEI_OUTPUT_TMP" &>/dev/null
@@ -630,6 +883,11 @@ main() {
   AI_MODEL="gemma3:latest"
   AI_API_KEY="ollama"
   AI_BATCH_SIZE=5
+
+  # Security-scan variables
+  RUN_SECURITY_SCAN=0
+  SECURITY_SCAN_TOOLS="trivy,bandit,safety,pip-audit,semgrep" # Default to all tools
+  FILTERED_TARGET_PATH=""                                     # Path to filtered target directory for scanning
 
   AI_USER_PROMPT=""
   AI_RESPONSE_TMPFILE=""
@@ -693,6 +951,11 @@ main() {
 
   checkDependencies
 
+  # Check security-scan dependencies if security-scan is enabled
+  if [[ "$RUN_SECURITY_SCAN" -eq 1 ]]; then
+    checkSecurityScanDependencies
+  fi
+
   # Check if Nuclei is already running
   if ps -p $(pgrep nuclei) >/dev/null 2>&1; then
     echo "❌ Nuclei is already running in another process. Please wait for it to finish."
@@ -715,28 +978,57 @@ main() {
 
   if [[ $USE_AI -eq 1 ]]; then
     if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
+      # Create a temporary file with full-matches added to the Nuclei output
+      nuclei_with_full_tmp=$(mktemp)
+      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$nuclei_with_full_tmp"
+      # Strip the /tmp/ from matched-at for both the Nuclei output and the AI response later
+      nuclei_with_full_stripped_tmp=$(mktemp)
+      strip_tmp_from_matched_at "$nuclei_with_full_tmp" >"$nuclei_with_full_stripped_tmp"
+      # Use the stripped Nuclei output as input to AI scoring
       AI_RESPONSE_TMPFILE=$(mktemp)
-      ai_scoring "$NUCLEI_OUTPUT_TMP" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
+      ai_scoring "$nuclei_with_full_stripped_tmp" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
+      # Now, we have:
+      #   $nuclei_with_full_stripped_tmp: Nuclei output with full-matches and stripped matched-at
+      #   $AI_RESPONSE_TMPFILE: AI results with stripped matched-at (and hopefully full-matches)
+      # We will use these two files as input to generateReport.
+      NUCLEI_OUTPUT_FOR_REPORT="$nuclei_with_full_stripped_tmp"
+      AI_RESPONSE_FOR_REPORT="$AI_RESPONSE_TMPFILE"
     else
       echo "✅ No findings from Nuclei, skipping AI analysis."
+      # In this case, we still want to run the non-AI path?
+      # We'll set the variables to the original Nuclei output (which is empty) and empty AI response.
+      NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_OUTPUT_TMP"
+      AI_RESPONSE_FOR_REPORT="/dev/null"
     fi
   else
-    {
-      output_add_full_line_tmp=$(mktemp)
-      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$output_add_full_line_tmp" 2>/dev/null
-      mv "$output_add_full_line_tmp" "$NUCLEI_OUTPUT_TMP"
-    } &
-    spinner_run "$!" "Adding full-line match(es) to findings..."
-
-    {
-      current_nuclei_output_tmp=$(mktemp)
-      strip_tmp_from_matched_at "$NUCLEI_OUTPUT_TMP" >"$current_nuclei_output_tmp"
-      mv "$current_nuclei_output_tmp" "$NUCLEI_OUTPUT_TMP"
-    } &
-    spinner_run "$!" "Stripping /tmp/ from matched-at paths..."
+    # Non-AI path: create a temporary file with full-matches and stripped matched-at
+    if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
+      nuclei_with_full_tmp=$(mktemp)
+      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$nuclei_with_full_tmp"
+      nuclei_with_full_stripped_tmp=$(mktemp)
+      strip_tmp_from_matched_at "$nuclei_with_full_tmp" >"$nuclei_with_full_stripped_tmp"
+      NUCLEI_OUTPUT_FOR_REPORT="$nuclei_with_full_stripped_tmp"
+      AI_RESPONSE_FOR_REPORT="/dev/null"
+    else
+      NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_OUTPUT_TMP"
+      AI_RESPONSE_FOR_REPORT="/dev/null"
+    fi
   fi
 
-  generateReport "$NUCLEI_OUTPUT_TMP" "$AI_RESPONSE_TMPFILE"
+  # Run security-scan workflow if enabled
+  if [[ "$RUN_SECURITY_SCAN" -eq 1 ]]; then
+    echo -e "\r🔒 Executing security-scan workflow..."
+    security_scan_report=$(runSecurityScanWorkflow "" "$FILTERED_TARGET_PATH")
+    spinner_run "$!" "Running security-scan tools..."
+    echo -e "\r📋 Security-scan workflow completed."
+  fi
+
+  generateReport "$NUCLEI_OUTPUT_FOR_REPORT" "$AI_RESPONSE_FOR_REPORT"
+
+  # Integrate security-scan results into the report if security-scan was run
+  if [[ "$RUN_SECURITY_SCAN" -eq 1 ]] && [[ -n "$security_scan_report" ]] && [[ -f "$security_scan_report" ]] && [[ -s "$security_scan_report" ]]; then
+    generateSecurityScanReportSection "$security_scan_report" "$NUCLEI_REPORT_FILE"
+  fi
 
   if [[ "$MODE" == "git" && "$GIT_TARGET_TYPE" -ne 2 ]]; then
     git_exclude_script
