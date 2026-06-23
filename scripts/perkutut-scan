@@ -27,7 +27,7 @@ cleanup() {
   find /tmp -type d -iname "nuclei*" -exec rm -rf {} \; &>/dev/null
   [[ -d "$SECURITY_SCAN_TEMP_DIR" ]] && rm -rf "$SECURITY_SCAN_TEMP_DIR" &>/dev/null
 }
-trap cleanup INT TERM
+trap cleanup EXIT INT TERM
 
 print_help() {
   echo "Usage: $0 [-m MODE] [-t TARGET] [-s] [--ai] [--aih URL] [--aim MODEL] [--aib N] [--aik KEY] [--tools LIST] [-h]"
@@ -1289,8 +1289,6 @@ main() {
   if [[ "$MODE" == "git" && "$GIT_TARGET_TYPE" -ne 2 ]]; then
     git_exclude_script
   fi
-
-  cleanup
 
   # Generate the final report using the processed inputs
   generateReport "$NUCLEI_OUTPUT_FOR_REPORT" "$AI_RESPONSE_FOR_REPORT"
