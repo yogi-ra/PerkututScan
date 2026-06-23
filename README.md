@@ -44,6 +44,7 @@ To perform a scan, use the `perkutut-scan` script with the following flags:
   * `-m`: Specifies the scan mode (`dir` for a local directory or `git` for a repository).
   * `-t`: Defines the target directory or repository URL.
   * `-s, --security-scan`: Enable security-scan workflow (runs Trivy, Bandit, Safety, Pip-Audit, Semgrep).
+  * `--tools LIST`: Comma-separated list of security tools to run (trivy,bandit,safety,pip-audit,semgrep).
   * `--ai`: Enables the AI analysis feature.
   * `--aih`: Sets a custom URL for the AI host (default: http://localhost:11434/v1).
   * `--aim`: Sets a custom AI model (default: gemma3:latest).
