@@ -19,15 +19,15 @@ set -euo pipefail
 cleanup() {
   [[ -f "$AI_USER_PROMPT" ]] && rm -f "$AI_USER_PROMPT" &>/dev/null
   [[ -f "$AI_RESPONSE_TMPFILE" ]] && rm -f "$AI_RESPONSE_TMPFILE" &>/dev/null
-  [[ -f "$nuclei_with_full_tmp" ]] && rm -f "$nuclei_with_full_tmp" &>/dev/null
-  [[ -f "$nuclei_with_full_stripped_tmp" ]] && rm -f "$nuclei_with_full_stripped_tmp" &>/dev/null
+  [[ -f "$NUCLEI_WITH_FULL_TMP" ]] && rm -f "$NUCLEI_WITH_FULL_TMP" &>/dev/null
+  [[ -f "$NUCLEI_WITH_FULL_STRIPPED_TMP" ]] && rm -f "$NUCLEI_WITH_FULL_STRIPPED_TMP" &>/dev/null
   [[ -d "$GIT_CLONED_TARGET" ]] && rm -rf "$GIT_CLONED_TARGET" &>/dev/null
   [[ -f "$NUCLEI_OUTPUT_TMP" ]] && rm -f "$NUCLEI_OUTPUT_TMP" &>/dev/null
   [[ -d "/tmp/$(basename "$TARGET")" ]] && rm -rf "/tmp/$(basename "$TARGET")" &>/dev/null
   find /tmp -type d -iname "nuclei*" -exec rm -rf {} \; &>/dev/null
   [[ -d "$SECURITY_SCAN_TEMP_DIR" ]] && rm -rf "$SECURITY_SCAN_TEMP_DIR" &>/dev/null
 }
-trap cleanup EXIT INT TERM
+trap cleanup INT TERM
 
 print_help() {
   echo "Usage: $0 [-m MODE] [-t TARGET] [-s] [--ai] [--aih URL] [--aim MODEL] [--aib N] [--aik KEY] [--tools LIST] [-h]"
@@ -370,7 +370,7 @@ EOF
   all_ai_results_tmp=$(mktemp)
   echo "[]" >"$all_ai_results_tmp"
 
-  url="$ai_url/chat/completions"
+  url="${ai_url}/chat/completions"
 
   for ((i = 0; i < num_batches; i++)); do
     local batch_num=$((i + 1))
@@ -555,72 +555,76 @@ spinner_run() {
 }
 
 parse_args() {
-  local opts
-
-  if ! opts=$(getopt -o m:t:s:h --long ai,aih:,aim:,aib:,aik:,security-scan,tools: -- "$@" 2>/dev/null); then
-    echo "❌ Invalid options"
-    print_help
-    exit 1
-  fi
-
-  eval set -- "$opts"
-
-  while true; do
+  while (($#)); do
     case "$1" in
     -m)
-      MODE="$2"
+      MODE=$2
       shift 2
       ;;
     -t)
-      TARGET="$2"
+      TARGET=$2
       shift 2
       ;;
-    -s | --security-scan)
+    -s)
       RUN_SECURITY_SCAN=1
       shift
       ;;
-    --tools)
-      SECURITY_SCAN_TOOLS="$2"
-      shift 2
+    -h)
+      SHOW_HELP=1
+      shift
       ;;
     --ai)
       USE_AI=1
       shift
       ;;
     --aih)
-      AI_URL="$2"
+      AI_URL=$2
       shift 2
       ;;
     --aim)
-      AI_MODEL="$2"
+      AI_MODEL=$2
       shift 2
       ;;
     --aib)
-      AI_BATCH_SIZE="$2"
+      AI_BATCH_SIZE=$2
       shift 2
       ;;
     --aik)
-      AI_API_KEY="$2"
+      AI_API_KEY=$2
       shift 2
       ;;
-    -h)
-      SHOW_HELP=1
+    --security-scan)
+      RUN_SECURITY_SCAN=1
       shift
+      ;;
+    --tools)
+      SECURITY_SCAN_TOOLS=$2
+      shift 2
       ;;
     --)
       shift
       break
-      ;;
+      ;; # stop parsing
     *)
       echo "❌ Unexpected option: $1"
       exit 1
       ;;
     esac
   done
+
+  # Positional target (if -t was omitted)
+  if [[ -z "$TARGET" && $# -gt 0 ]]; then
+    TARGET=$1
+    shift
+  fi
+
+  if (($#)); then
+    echo "❌ Unexpected positional argument(s): $*"
+    exit 1
+  fi
 }
 
 # === Security-scan tool functions ===
-
 runTrivyScan() {
   local source="$1"
   local real_target="$2"
@@ -655,7 +659,7 @@ runTrivyScan() {
     echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format json"
     echo ""
     echo "Output:"
-    echo "```json"
+    echo "$()$(json"
     # Run Trivy and convert to common format
     local trivy_json_raw
     trivy_json_raw=$(docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format json 2>/dev/null) || {
@@ -663,7 +667,7 @@ runTrivyScan() {
     }
     echo "$trivy_json_raw" | jq -c '[ .Results[] | (if .Type == "vulnerability" then .Vulnerabilities[] else .Secrets[] end) | { "template-id": (if .VulnerabilityID then .VulnerabilityID else .RuleID end), "matched-at": .Target, "extracted-results": [ (if .VulnerabilityID then .VulnerabilityID else .RuleID end) ], "severity": (if .Severity then (.Severity | ascii_downcase) else "unknown" end) } ]' > "${trivy_json_output}"
     cat "${trivy_json_output}"
-    echo "```"
+    echo ")$()"
     echo ""
   } >>"${temp_dir}/security-scan-report.md"
 
@@ -691,7 +695,7 @@ runTrivyScan() {
     echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest rootfs /src"
     echo ""
     echo "Output:"
-    echo "```json"
+    echo "$()$(json"
     # Run Trivy RootFS and convert to common format
     local trivy_rootfs_json_raw
     trivy_rootfs_json_raw=$(docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest rootfs /src 2>/dev/null) || {
@@ -699,7 +703,7 @@ runTrivyScan() {
     }
     echo "$trivy_rootfs_json_raw" | jq -c '[ .Results[] | (if .Type == "vulnerability" then .Vulnerabilities[] else .Secrets[] end) | { "template-id": (if .VulnerabilityID then .VulnerabilityID else .RuleID end), "matched-at": .Target, "extracted-results": [ (if .VulnerabilityID then .VulnerabilityID else .RuleID end) ], "severity": (if .Severity then (.Severity | ascii_downcase) else "unknown" end) } ]' > "${trivy_rootfs_json_output}"
     cat "${trivy_rootfs_json_output}"
-    echo "```"
+    echo ")$()"
     echo ""
   } >>"${temp_dir}/security-scan-report.md"
 }
@@ -766,7 +770,7 @@ runSafetyScan() {
   if command -v safety >/dev/null 2>&1 && [[ -f "${real_target}/requirements.txt" ]]; then
     # Create temporary file for safety JSON output
     local safety_json_output="${temp_dir}/safety.json"
-    echo "[]" > "$safety_json_output"  # Start with empty array
+    echo "[]" >"$safety_json_output" # Start with empty array
 
     # Process safety output line by line
     while IFS= read -r line; do
@@ -781,7 +785,7 @@ runSafetyScan() {
           local info=""
 
           # Extract vulnerability ID (might be multiple)
-          for ((i=2; i<${#pkg_ver_vuln[@]}; i++)); do
+          for ((i = 2; i < ${#pkg_ver_vuln[@]}; i++)); do
             if [[ "${pkg_ver_vuln[i]}" == CVE-* ]] || [[ "${pkg_ver_vuln[i]}" == PYSEC-* ]] || [[ "${pkg_ver_vuln[i]}" == GHSA-* ]]; then
               vulnerability="${pkg_ver_vuln[i]}"
               break
@@ -803,7 +807,7 @@ runSafetyScan() {
 
           # Append to array
           if [[ -f "$safety_json_output" ]]; then
-            jq --argjson new "$json_obj" '. + [$new]' "$safety_json_output" > "${safety_json_output}.tmp" && mv "${safety_json_output}.tmp" "$safety_json_output"
+            jq --argjson new "$json_obj" '. + [$new]' "$safety_json_output" >"${safety_json_output}.tmp" && mv "${safety_json_output}.tmp" "$safety_json_output"
           fi
         fi
       fi
@@ -842,7 +846,7 @@ runPipAuditScan() {
   if command -v pip-audit >/dev/null 2>&1 && [[ -f "${real_target}/requirements.txt" ]]; then
     # Create temporary file for pip-audit JSON output
     local pip_audit_json_output="${temp_dir}/pip-audit.json"
-    echo "[]" > "$pip_audit_json_output"  # Start with empty array
+    echo "[]" >"$pip_audit_json_output" # Start with empty array
 
     # Process pip-audit output line by line (txt format)
     # Format: package: version: vulnerability ID [more info]
@@ -851,9 +855,9 @@ runPipAuditScan() {
         # Parse pip-audit output: package: version: vulnerability ID
         # Example: "django: 2.0.0: CVE-2019-14234"
         if [[ "$line" =~ : ]]; then
-          IFS=':' read -r pkg_ver vuln <<< "$line"
+          IFS=':' read -r pkg_ver vuln <<<"$line"
           # Further split package and version
-          IFS=' ' read -r package version <<< "$pkg_ver"
+          IFS=' ' read -r package version <<<"$pkg_ver"
           # Remove leading/trailing whitespace
           package=$(echo "$package" | xargs)
           version=$(echo "$version" | xargs)
@@ -869,7 +873,7 @@ runPipAuditScan() {
 
             # Append to array
             if [[ -f "$pip_audit_json_output" ]]; then
-              jq --argjson new "$json_obj" '. + [$new]' "$pip_audit_json_output" > "${pip_audit_json_output}.tmp" && mv "${pip_audit_json_output}.tmp" "$pip_audit_json_output"
+              jq --argjson new "$json_obj" '. + [$new]' "$pip_audit_json_output" >"${pip_audit_json_output}.tmp" && mv "${pip_audit_json_output}.tmp" "$pip_audit_json_output"
             fi
           fi
         fi
@@ -927,7 +931,7 @@ runSecurityScanWorkflow() {
 
   # Create combined JSON output file for all security scan results
   SECURITY_SCAN_COMBINED_JSON="${SECURITY_SCAN_TEMP_DIR}/combined-security-results.json"
-  echo "[]" > "$SECURITY_SCAN_COMBINED_JSON"  # Start with empty array
+  echo "[]" >"$SECURITY_SCAN_COMBINED_JSON" # Start with empty array
 
   # Initialize security-scan report
   {
@@ -947,38 +951,38 @@ runSecurityScanWorkflow() {
       runTrivyScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
       # Add Trivy results to combined JSON
       if [[ -f "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" && -s "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" ]]; then
-        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" > "${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
+        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       if [[ -f "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" && -s "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" ]]; then
-        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" > "${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
+        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     bandit)
       runBanditScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
       # Add Bandit results to combined JSON
       if [[ -f "${SECURITY_SCAN_TEMP_DIR}/bandit.json" && -s "${SECURITY_SCAN_TEMP_DIR}/bandit.json" ]]; then
-        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/bandit.json" > "${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
+        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/bandit.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     safety)
       runSafetyScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
       # Add Safety results to combined JSON
       if [[ -f "${SECURITY_SCAN_TEMP_DIR}/safety.json" && -s "${SECURITY_SCAN_TEMP_DIR}/safety.json" ]]; then
-        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/safety.json" > "${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
+        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/safety.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     pip-audit)
       runPipAuditScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
       # Add Pip-Audit results to combined JSON
       if [[ -f "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" && -s "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" ]]; then
-        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" > "${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
+        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     semgrep)
       runSemgrepScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
       # Add Semgrep results to combined JSON
       if [[ -f "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" && -s "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" ]]; then
-        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" > "${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
+        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     *)
@@ -1081,6 +1085,8 @@ main() {
   SHOW_HELP=0
   TARGET=""
   USE_AI=0
+  NUCLEI_WITH_FULL_TMP=""
+  NUCLEI_WITH_FULL_STRIPPED_TMP=""
 
   parse_args "$@"
 
@@ -1158,19 +1164,19 @@ main() {
   if [[ $USE_AI -eq 1 ]]; then
     if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
       # Create a temporary file with full-matches added to the Nuclei output
-      nuclei_with_full_tmp=$(mktemp)
-      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$nuclei_with_full_tmp"
+      NUCLEI_WITH_FULL_TMP=$(mktemp)
+      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$NUCLEI_WITH_FULL_TMP"
       # Strip the /tmp/ from matched-at for both the Nuclei output and the AI response later
-      nuclei_with_full_stripped_tmp=$(mktemp)
-      strip_tmp_from_matched_at "$nuclei_with_full_tmp" >"$nuclei_with_full_stripped_tmp"
+      NUCLEI_WITH_FULL_STRIPPED_TMP=$(mktemp)
+      strip_tmp_from_matched_at "$NUCLEI_WITH_FULL_TMP" >"$NUCLEI_WITH_FULL_STRIPPED_TMP"
       # Use the stripped Nuclei output as input to AI scoring
       AI_RESPONSE_TMPFILE=$(mktemp)
-      ai_scoring "$nuclei_with_full_stripped_tmp" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
+      ai_scoring "$NUCLEI_WITH_FULL_STRIPPED_TMP" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
       # Now, we have:
-      #   $nuclei_with_full_stripped_tmp: Nuclei output with full-matches and stripped matched-at
+      #   $NUCLEI_WITH_FULL_STRIPPED_TMP: Nuclei output with full-matches and stripped matched-at
       #   $AI_RESPONSE_TMPFILE: AI results with stripped matched-at (and hopefully full-matches)
       # We will use these two files as input to generateReport.
-      NUCLEI_OUTPUT_FOR_REPORT="$nuclei_with_full_stripped_tmp"
+      NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_WITH_FULL_STRIPPED_TMP"
       AI_RESPONSE_FOR_REPORT="$AI_RESPONSE_TMPFILE"
     else
       echo "✅ No findings from Nuclei, skipping AI analysis."
@@ -1182,11 +1188,11 @@ main() {
   else
     # Non-AI path: create a temporary file with full-matches and stripped matched-at
     if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
-      nuclei_with_full_tmp=$(mktemp)
-      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$nuclei_with_full_tmp"
-      nuclei_with_full_stripped_tmp=$(mktemp)
-      strip_tmp_from_matched_at "$nuclei_with_full_tmp" >"$nuclei_with_full_stripped_tmp"
-      NUCLEI_OUTPUT_FOR_REPORT="$nuclei_with_full_stripped_tmp"
+      NUCLEI_WITH_FULL_TMP=$(mktemp)
+      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$NUCLEI_WITH_FULL_TMP"
+      NUCLEI_WITH_FULL_STRIPPED_TMP=$(mktemp)
+      strip_tmp_from_matched_at "$NUCLEI_WITH_FULL_TMP" >"$NUCLEI_WITH_FULL_STRIPPED_TMP"
+      NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_WITH_FULL_STRIPPED_TMP"
       AI_RESPONSE_FOR_REPORT="/dev/null"
     else
       NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_OUTPUT_TMP"
@@ -1195,96 +1201,14 @@ main() {
   fi
 
   # Run security-scan workflow if enabled
-  if [[ "$RUN_SECURITY_SCAN" -eq 1 ]]; then
-    echo -e "\r🔒 Executing security-scan workflow..."
-    runSecurityScanWorkflow "" "$FILTERED_TARGET_PATH"
-    spinner_run "$!" "Running security-scan tools..."
-    echo -e "\r📋 Security-scan workflow completed."
-    # Set the security scan report path for later use
-    security_scan_report="${SECURITY_SCAN_TEMP_DIR}/security-scan-report.md"
-  fi
-
-  # Prepare input for report generation
-  if [[ "$USE_AI" -eq 1 ]]; then
-    if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
-      # Create a temporary file with full-matches added to the Nuclei output
-      nuclei_with_full_tmp=$(mktemp)
-      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$nuclei_with_full_tmp"
-      # Strip the /tmp/ from matched-at for both the Nuclei output and the AI response later
-      nuclei_with_full_stripped_tmp=$(mktemp)
-      strip_tmp_from_matched_at "$nuclei_with_full_tmp" >"$nuclei_with_full_stripped_tmp"
-
-      # Combine Nuclei results with security scan results (if available)
-      if [[ "$RUN_SECURITY_SCAN" -eq 1 && -f "$SECURITY_SCAN_COMBINED_JSON" && -s "$SECURITY_SCAN_COMBINED_JSON" ]]; then
-        # Combine Nuclei and security scan results
-        combined_input_tmp=$(mktemp)
-        jq -s '.[0] + .[1]' "$nuclei_with_full_stripped_tmp" "$SECURITY_SCAN_COMBINED_JSON" > "$combined_input_tmp"
-
-        # Use the combined input as input to AI scoring
-        AI_RESPONSE_TMPFILE=$(mktemp)
-        ai_scoring "$combined_input_tmp" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
-
-        # For the final report generation, we need the AI-enhanced version of the combined input
-        NUCLEI_OUTPUT_FOR_REPORT="$combined_input_tmp"
-        AI_RESPONSE_FOR_REPORT="$AI_RESPONSE_TMPFILE"
-      else
-        # No security scan results or security scan not run, use only Nuclei
-        # Use the stripped Nuclei output as input to AI scoring
-        AI_RESPONSE_TMPFILE=$(mktemp)
-        ai_scoring "$nuclei_with_full_stripped_tmp" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
-
-        # For the final report generation, we need the AI-enhanced version
-        NUCLEI_OUTPUT_FOR_REPORT="$nuclei_with_full_stripped_tmp"
-        AI_RESPONSE_FOR_REPORT="$AI_RESPONSE_TMPFILE"
-      fi
-    else
-      echo "✅ No findings from Nuclei, skipping AI analysis."
-      # In this case, we still want to run the non-AI path?
-      # We'll set the variables to the original Nuclei output (which is empty) and empty AI response.
-      if [[ "$RUN_SECURITY_SCAN" -eq 1 && -f "$SECURITY_SCAN_COMBINED_JSON" && -s "$SECURITY_SCAN_COMBINED_JSON" ]]; then
-        # Use only security scan results
-        NUCLEI_OUTPUT_FOR_REPORT="$SECURITY_SCAN_COMBINED_JSON"
-        AI_RESPONSE_FOR_REPORT="/dev/null"
-      else
-        # No findings from either source
-        NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_OUTPUT_TMP"
-        AI_RESPONSE_FOR_REPORT="/dev/null"
-      fi
-    fi
-  else
-    # Non-AI path: create a temporary file with full-matches and stripped matched-at
-    if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
-      nuclei_with_full_tmp=$(mktemp)
-      add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$nuclei_with_full_tmp"
-      nuclei_with_full_stripped_tmp=$(mktemp)
-      strip_tmp_from_matched_at "$nuclei_with_full_tmp" >"$nuclei_with_full_stripped_tmp"
-
-      # Combine Nuclei results with security scan results (if available)
-      if [[ "$RUN_SECURITY_SCAN" -eq 1 && -f "$SECURITY_SCAN_COMBINED_JSON" && -s "$SECURITY_SCAN_COMBINED_JSON" ]]; then
-        # Combine Nuclei and security scan results
-        combined_input_tmp=$(mktemp)
-        jq -s '.[0] + .[1]' "$nuclei_with_full_stripped_tmp" "$SECURITY_SCAN_COMBINED_JSON" > "$combined_input_tmp"
-
-        NUCLEI_OUTPUT_FOR_REPORT="$combined_input_tmp"
-        AI_RESPONSE_FOR_REPORT="/dev/null"
-      else
-        # No security scan results or security scan not run, use only Nuclei
-        NUCLEI_OUTPUT_FOR_REPORT="$nuclei_with_full_stripped_tmp"
-        AI_RESPONSE_FOR_REPORT="/dev/null"
-      fi
-    else
-      # No Nuclei results
-      if [[ "$RUN_SECURITY_SCAN" -eq 1 && -f "$SECURITY_SCAN_COMBINED_JSON" && -s "$SECURITY_SCAN_COMBINED_JSON" ]]; then
-        # Use only security scan results
-        NUCLEI_OUTPUT_FOR_REPORT="$SECURITY_SCAN_COMBINED_JSON"
-        AI_RESPONSE_FOR_REPORT="/dev/null"
-      else
-        # No findings from either source
-        NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_OUTPUT_TMP"
-        AI_RESPONSE_FOR_REPORT="/dev/null"
-      fi
-    fi
-  fi
+  # if [[ "$RUN_SECURITY_SCAN" -eq 1 ]]; then
+  #   echo -e "\r🔒 Executing security-scan workflow..."
+  #   runSecurityScanWorkflow "" "$FILTERED_TARGET_PATH"
+  #   spinner_run "$!" "Running security-scan tools..."
+  #   echo -e "\r📋 Security-scan workflow completed."
+  #   # Set the security scan report path for later use
+  #   security_scan_report="${SECURITY_SCAN_TEMP_DIR}/security-scan-report.md"
+  # fi
 
   if [[ "$MODE" == "git" && "$GIT_TARGET_TYPE" -ne 2 ]]; then
     git_exclude_script
@@ -1292,6 +1216,8 @@ main() {
 
   # Generate the final report using the processed inputs
   generateReport "$NUCLEI_OUTPUT_FOR_REPORT" "$AI_RESPONSE_FOR_REPORT"
+
+  cleanup
 
   # If High/Critical vulnerabilities found, exit 1, else exit 0
   if [[ "$MAJOR_VULN_FOUND" -eq 1 ]]; then
