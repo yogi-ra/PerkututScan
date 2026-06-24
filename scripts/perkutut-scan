@@ -34,7 +34,7 @@ print_help() {
   echo "  -m      Scan mode (dir, git)"
   echo "  -t      Target directory or repo"
   echo "  -s, --security-scan   Enable security-scan workflow"
-  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,safety,pip-audit,semgrep)"
+  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,pip-audit,semgrep)"
   echo "  --ai    Enable AI"
   echo "  --aih   AI URL (default: $AI_URL)"
   echo "  --aim   AI Model (default: $AI_MODEL)"
@@ -47,7 +47,7 @@ print_git_help() {
   echo "Git mode help:"
   echo "  -m git -t <repo/git project dir path/current directory(leave blank)>    Scan git project"
   echo "  -s, --security-scan   Enable security-scan workflow"
-  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,safety,pip-audit,semgrep)"
+  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,pip-audit,semgrep)"
   echo "  --ai    Enable AI"
   echo "  --aih   AI URL (default: $AI_URL)"
   echo "  --aim   AI Model (default: $AI_MODEL)"
@@ -59,7 +59,7 @@ print_dir_help() {
   echo "Dir mode help:"
   echo "  -m dir -t <path>    Scan directory"
   echo "  -s, --security-scan   Enable security-scan workflow"
-  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,safety,pip-audit,semgrep)"
+  echo "  --tools LIST          Comma-separated list of security tools to run (trivy,bandit,pip-audit,semgrep)"
   echo "  --ai    Enable AI"
   echo "  --aih   AI URL (default: $AI_URL)"
   echo "  --aim   AI Model (default: $AI_MODEL)"
@@ -82,9 +82,6 @@ generateReport() {
   if [[ -n "$ai_analysis_file" && -s "$ai_analysis_file" ]]; then
     echo -e "\n🤖 Filtering and enhancing report with AI analysis..."
 
-    # Merge Nuclei and AI results. Filter out false positives (accuracy: 0).
-    # Update severity and add reasoning from AI.
-    # Prefer AI's full-matches, fall back to Nuclei's full-matches.
     final_findings_json=$(jq -s '
       .[0] as $nuclei |
       .[1] as $ai |
@@ -185,17 +182,22 @@ checkDependencies() {
 
 checkSecurityScanDependencies() {
   # Check for dependencies needed for security-scan workflow
-  local docker_available=false
+  local trivy_available=false
+  local semgrep_available=false
   local bandit_available=false
-  local safety_available=false
   local pip_audit_available=false
   local missing_tools=()
 
-  # Check Docker (needed for Trivy and Semgrep)
-  if command -v docker >/dev/null 2>&1; then
-    docker_available=true
+  if command -v semgrep >/dev/null 2>&1; then
+    semgrep_available=true
   else
-    missing_tools+=("docker")
+    missing_tools+=("semgrep")
+  fi
+
+  if command -v trivy >/dev/null 2>&1; then
+    trivy_available=true
+  else
+    missing_tools+=("trivy")
   fi
 
   # Check Bandit (for Python security issues)
@@ -203,13 +205,6 @@ checkSecurityScanDependencies() {
     bandit_available=true
   else
     missing_tools+=("bandit")
-  fi
-
-  # Check Safety (for dependency vulnerability checking)
-  if command -v safety >/dev/null 2>&1; then
-    safety_available=true
-  else
-    missing_tools+=("safety")
   fi
 
   # Check Pip-Audit (for dependency vulnerability checking)
@@ -220,9 +215,9 @@ checkSecurityScanDependencies() {
   fi
 
   # Store availability in global variables for use in tool functions
-  SECURITY_SCAN_DOCKER_AVAILABLE=$docker_available
+  SECURITY_SCAN_TRIVY_AVAILABLE=$trivy_available
+  SECURITY_SCAN_SEMGREP_AVAILABLE=$semgrep_available
   SECURITY_SCAN_BANDIT_AVAILABLE=$bandit_available
-  SECURITY_SCAN_SAFETY_AVAILABLE=$safety_available
   SECURITY_SCAN_PIP_AUDIT_AVAILABLE=$pip_audit_available
 
   # Warn about missing tools but don't exit - we'll handle gracefully in each tool function
@@ -430,10 +425,7 @@ EOF
     local batch_json_result=""
     batch_json_result=$(naive_ai_text_response_to_json "$cleaned_response")
 
-    # Combine the current batch result with the accumulated results
-    # First, check if the JSON is valid
     if echo "$batch_json_result" | jq -e . >/dev/null 2>&1; then
-      # If valid, append to the temporary file
       if [[ $(echo "$batch_json_result" | jq 'length') -gt 0 ]]; then
         local combined_results=""
         combined_results=$(jq -s '.[0] + .[1]' "$all_ai_results_tmp" <(echo "$batch_json_result"))
@@ -624,86 +616,57 @@ parse_args() {
   fi
 }
 
-# === Security-scan tool functions ===
+runSemgrepScan() {
+  local source="$1"
+  local real_target="$2"
+  local temp_dir="$3"
+
+  if [[ "$SECURITY_SCAN_SEMGREP_AVAILABLE" ]]; then
+    echo "⚠️  Skipping Semgrep scan (Semgrep not available)"
+    return
+  fi
+
+  echo "🔍 Running Semgrep Security Audit..."
+  {
+    echo "## Semgrep Security Audit (OWASP Top Ten & General Security)"
+    echo ""
+    echo "Command: semgrep --config p/security-audit --config p/owasp-top-ten /src --json"
+    echo ""
+    echo "Output:"
+    echo "$()$("semgrep --config p/security-audit --config p/owasp-top-ten /src --json")$()"
+    echo ""
+  } >>"${temp_dir}/security-scan-report.md"
+}
+
 runTrivyScan() {
   local source="$1"
   local real_target="$2"
   local temp_dir="$3"
 
-  if [[ "$SECURITY_SCAN_DOCKER_AVAILABLE" != "true" ]]; then
-    echo "⚠️  Skipping Trivy scan (Docker not available)"
+  if [[ "$SECURITY_SCAN_TRIVY_AVAILABLE" ]]; then
+    echo "⚠️  Skipping Trivy scan (Trivy not available)"
     return
   fi
 
-  # Trivy Filesystem Scan
-  local trivy_output="${temp_dir}/trivy_filesystem.txt"
-  echo "🔍 Running Trivy Filesystem Scan..."
-  {
-    echo "## Trivy Filesystem Scan (Vulnerabilities & Secrets)"
-    echo ""
-    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format table"
-    echo ""
-    echo "Output:"
-    echo "$()$("
-    docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format table | tee "${trivy_output}"
-    echo ")$()"
-    echo ""
-  } >>"${temp_dir}/security-scan-report.md"
+  if trivy fs /src \
+    --scanners vuln,secret \
+    --vuln-type os,library \
+    --format json >"${temp_dir}/security_scan_report.md" 2>/dev/null; then
+    :
+  else
+    echo "[]" >"${temp_dir}/security_scan_report.md"
+  fi
 
-  # Trivy Filesystem Scan (JSON format for integration)
-  local trivy_json_output="${temp_dir}/trivy_filesystem.json"
-  echo "🔍 Running Trivy Filesystem Scan (JSON)..."
-  {
-    echo "## Trivy Filesystem Scan (JSON)"
-    echo ""
-    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format json"
-    echo ""
-    echo "Output:"
-    echo "$()$(json"
-    # Run Trivy and convert to common format
-    local trivy_json_raw
-    trivy_json_raw=$(docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest fs /src --scanners vuln,secret --vuln-type os,library --format json 2>/dev/null) || {
-        echo "[]"
-    }
-    echo "$trivy_json_raw" | jq -c '[ .Results[] | (if .Type == "vulnerability" then .Vulnerabilities[] else .Secrets[] end) | { "template-id": (if .VulnerabilityID then .VulnerabilityID else .RuleID end), "matched-at": .Target, "extracted-results": [ (if .VulnerabilityID then .VulnerabilityID else .RuleID end) ], "severity": (if .Severity then (.Severity | ascii_downcase) else "unknown" end) } ]' > "${trivy_json_output}"
-    cat "${trivy_json_output}"
-    echo ")$()"
-    echo ""
-  } >>"${temp_dir}/security-scan-report.md"
-
-  # Trivy RootFS Scan
   local trivy_rootfs_output="${temp_dir}/trivy_rootfs.txt"
   echo "🔍 Running Trivy RootFS Scan..."
   {
     echo "## Trivy RootFS Scan"
     echo ""
-    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest rootfs /src"
+    echo "Command: trivy rootfs /src"
     echo ""
     echo "Output:"
-    echo "$()$("
-    docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest rootfs /src 2>/dev/null || echo 'RootFS scan skipped (not applicable or requires root)' | tee "${trivy_rootfs_output}"
-    echo ")$()"
-    echo ""
-  } >>"${temp_dir}/security-scan-report.md"
-
-  # Trivy RootFS Scan (JSON format for integration)
-  local trivy_rootfs_json_output="${temp_dir}/trivy_rootfs.json"
-  echo "🔍 Running Trivy RootFS Scan (JSON)..."
-  {
-    echo "## Trivy RootFS Scan (JSON)"
-    echo ""
-    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm aquasec/trivy:latest rootfs /src"
-    echo ""
-    echo "Output:"
-    echo "$()$(json"
-    # Run Trivy RootFS and convert to common format
-    local trivy_rootfs_json_raw
-    trivy_rootfs_json_raw=$(docker run -v "${real_target}:/src:ro" -i --rm aquasec/trivy:latest rootfs /src 2>/dev/null) || {
-        echo "[]"
-    }
-    echo "$trivy_rootfs_json_raw" | jq -c '[ .Results[] | (if .Type == "vulnerability" then .Vulnerabilities[] else .Secrets[] end) | { "template-id": (if .VulnerabilityID then .VulnerabilityID else .RuleID end), "matched-at": .Target, "extracted-results": [ (if .VulnerabilityID then .VulnerabilityID else .RuleID end) ], "severity": (if .Severity then (.Severity | ascii_downcase) else "unknown" end) } ]' > "${trivy_rootfs_json_output}"
-    cat "${trivy_rootfs_json_output}"
-    echo ")$()"
+    echo "
+    $()$("trivy rootfs /src 2>/dev/null || echo 'RootFS scan skipped (not applicable or requires root)' | tee "${trivy_rootfs_output}" echo ")$()"
     echo ""
   } >>"${temp_dir}/security-scan-report.md"
 }
@@ -725,94 +688,9 @@ runBanditScan() {
     echo "Command: bandit -r \"${real_target}\" -lll --format txt"
     echo ""
     echo "Output:"
-    echo "$()$("
-    bandit -r "${real_target}" -lll --format txt | tee "${temp_dir}/bandit.txt"
-    echo ")$()"
+    echo ""
     echo ""
   } >>"${temp_dir}/security-scan-report.md"
-
-  # Also generate JSON output for integration with main report
-  if command -v bandit >/dev/null 2>&1; then
-    bandit -r "${real_target}" -lll --format_json | tee "${temp_dir}/bandit.json" >/dev/null || true
-  fi
-}
-
-runSafetyScan() {
-  local source="$1"
-  local real_target="$2"
-  local temp_dir="$3"
-
-  if [[ "$SECURITY_SCAN_SAFETY_AVAILABLE" != "true" ]] || [[ ! -f "${real_target}/requirements.txt" ]]; then
-    if [[ ! -f "${real_target}/requirements.txt" ]]; then
-      echo "⚠️  Skipping Safety scan (requirements.txt not found)"
-    else
-      echo "⚠️  Skipping Safety scan (safety not available)"
-    fi
-    return
-  fi
-
-  echo "🔍 Running Safety Dependency Vulnerability Check..."
-  {
-    echo "## Safety Dependency Vulnerability Check"
-    echo ""
-    echo "Command: safety check -r \"${real_target}/requirements.txt\" --bare"
-    echo ""
-    echo "Output:"
-    echo "$()$("
-    safety check -r "${real_target}/requirements.txt" --bare | tee "${temp_dir}/safety.txt"
-    echo ")$()"
-    echo ""
-  } >>"${temp_dir}/security-scan-report.md"
-
-  # Also generate simplified JSON output for integration with main report
-  # Safety output format: package_name version_spec vulnerability_id [more_info]
-  # We'll convert to our format
-  if command -v safety >/dev/null 2>&1 && [[ -f "${real_target}/requirements.txt" ]]; then
-    # Create temporary file for safety JSON output
-    local safety_json_output="${temp_dir}/safety.json"
-    echo "[]" >"$safety_json_output" # Start with empty array
-
-    # Process safety output line by line
-    while IFS= read -r line; do
-      if [[ -n "$line" && ! "$line" =~ ^[[:space:]]*$ ]]; then
-        # Parse safety output: package version vulnerability [more info]
-        # Example: "django 2.0.0 CVE-2019-14234 (https://vuldb.com/?id.123456)"
-        local pkg_ver_vuln=($line)
-        if [[ ${#pkg_ver_vuln[@]} -ge 3 ]]; then
-          local package="${pkg_ver_vuln[0]}"
-          local version="${pkg_ver_vuln[1]}"
-          local vulnerability=""
-          local info=""
-
-          # Extract vulnerability ID (might be multiple)
-          for ((i = 2; i < ${#pkg_ver_vuln[@]}; i++)); do
-            if [[ "${pkg_ver_vuln[i]}" == CVE-* ]] || [[ "${pkg_ver_vuln[i]}" == PYSEC-* ]] || [[ "${pkg_ver_vuln[i]}" == GHSA-* ]]; then
-              vulnerability="${pkg_ver_vuln[i]}"
-              break
-            fi
-          done
-
-          # If no specific vulnerability ID found, use the third field
-          if [[ -z "$vulnerability" ]]; then
-            vulnerability="${pkg_ver_vuln[2]}"
-          fi
-
-          # Create JSON object for this finding
-          local json_obj=$(jq -n \
-            --arg pkg "$package" \
-            --arg ver "$version" \
-            --arg vuln "$vulnerability" \
-            --arg info "$info" \
-            '{template-id: "safety-" + $vuln, matched-at: "requirements.txt", extracted-results: [$pkg, $ver], severity: "medium"}')
-
-          # Append to array
-          if [[ -f "$safety_json_output" ]]; then
-            jq --argjson new "$json_obj" '. + [$new]' "$safety_json_output" >"${safety_json_output}.tmp" && mv "${safety_json_output}.tmp" "$safety_json_output"
-          fi
-        fi
-      fi
-    done < <(safety check -r "${real_target}/requirements.txt" --bare 2>/dev/null || true)
-  fi
 }
 
 runPipAuditScan() {
@@ -836,9 +714,7 @@ runPipAuditScan() {
     echo "Command: pip-audit -r \"${real_target}/requirements.txt\" --format txt"
     echo ""
     echo "Output:"
-    echo "$()$("
-    pip-audit -r "${real_target}/requirements.txt" --format txt | tee "${temp_dir}/pip-audit.txt"
-    echo ")$()"
+    echo "$()$("pip-audit -r "${real_target}/requirements.txt" --format txt | tee \"${temp_dir}/pip-audit.txt\"")$()"
     echo ""
   } >>"${temp_dir}/security-scan-report.md"
 
@@ -882,117 +758,65 @@ runPipAuditScan() {
   fi
 }
 
-runSemgrepScan() {
-  local source="$1"
-  local real_target="$2"
-  local temp_dir="$3"
-
-  if [[ "$SECURITY_SCAN_DOCKER_AVAILABLE" != "true" ]]; then
-    echo "⚠️  Skipping Semgrep scan (Docker not available)"
-    return
-  fi
-
-  echo "🔍 Running Semgrep Security Audit..."
-  {
-    echo "## Semgrep Security Audit (OWASP Top Ten & General Security)"
-    echo ""
-    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm --entrypoint semgrep semgrep/semgrep:latest --config p/security-audit --config p/owasp-top-ten /src"
-    echo ""
-    echo "Output:"
-    echo "$()$("
-    docker run -v "${real_target}:/src:ro" -i --rm --entrypoint semgrep semgrep/semgrep:latest --config p/security-audit --config p/owasp-top-ten /src | tee "${temp_dir}/semgrep.txt"
-    echo ")$()"
-    echo ""
-  } >>"${temp_dir}/security-scan-report.md"
-
-  # Also generate JSON output for integration with main report
-  # Semgrep can output JSON directly
-  local semgrep_json_output="${temp_dir}/semgrep.json"
-  echo "🔍 Running Semgrep Security Audit (JSON)..."
-  {
-    echo "## Semgrep Security Audit (JSON)"
-    echo ""
-    echo "Command: docker run -v \"${real_target}:/src:ro\" -i --rm --entrypoint semgrep semgrep/semgrep:latest --config p/security-audit --config p/owasp-top-ten /src --json"
-    echo ""
-    echo "Output:"
-    echo "$()$("
-    docker run -v "${real_target}:/src:ro" -i --rm --entrypoint semgrep semgrep/semgrep:latest --config p/security-audit --config p/owasp-top-ten /src --json 2>/dev/null | tee "${semgrep_json_output}"
-    echo ")$()"
-    echo ""
-  } >>"${temp_dir}/security-scan-report.md"
-}
-
 runSecurityScanWorkflow() {
   local source="$1"
   local real_target="$2"
 
-  # Create temporary directory for security-scan outputs
   SECURITY_SCAN_TEMP_DIR=$(mktemp -d)
-
-  # Create combined JSON output file for all security scan results
   SECURITY_SCAN_COMBINED_JSON="${SECURITY_SCAN_TEMP_DIR}/combined-security-results.json"
-  echo "[]" >"$SECURITY_SCAN_COMBINED_JSON" # Start with empty array
+  echo "[]" >"$SECURITY_SCAN_COMBINED_JSON"
 
-  # Initialize security-scan report
   {
     echo "# Security Scan Report"
     echo "**Date:** $(date)"
-    echo "**Project:** $(basename "${real_target}")"
+    echo "**Project:** $(basename "$real_target")"
     echo ""
   } >"${SECURITY_SCAN_TEMP_DIR}/security-scan-report.md"
 
-  # Parse the tools to run (comma-separated list)
   IFS=',' read -ra TOOLS_ARRAY <<<"$SECURITY_SCAN_TOOLS"
 
-  # Run selected tools
   for tool in "${TOOLS_ARRAY[@]}"; do
     case "$tool" in
     trivy)
+      echo "🚀 Running Trivy scans…"
       runTrivyScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
-      # Add Trivy results to combined JSON
-      if [[ -f "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" && -s "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" ]]; then
+      # Merge JSON results (ignore missing files – jq will treat them as null)
+      if [[ -s "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" ]]; then
         jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/trivy_filesystem.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
-      if [[ -f "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" && -s "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" ]]; then
+      if [[ -s "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" ]]; then
         jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/trivy_rootfs.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     bandit)
+      echo "🚀 Running Bandit scan…"
       runBanditScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
-      # Add Bandit results to combined JSON
-      if [[ -f "${SECURITY_SCAN_TEMP_DIR}/bandit.json" && -s "${SECURITY_SCAN_TEMP_DIR}/bandit.json" ]]; then
+      if [[ -s "${SECURITY_SCAN_TEMP_DIR}/bandit.json" ]]; then
         jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/bandit.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
-    safety)
-      runSafetyScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
-      # Add Safety results to combined JSON
-      if [[ -f "${SECURITY_SCAN_TEMP_DIR}/safety.json" && -s "${SECURITY_SCAN_TEMP_DIR}/safety.json" ]]; then
-        jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/safety.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
-      fi
-      ;;
     pip-audit)
+      echo "🚀 Running pip‑audit scan…"
       runPipAuditScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
-      # Add Pip-Audit results to combined JSON
-      if [[ -f "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" && -s "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" ]]; then
+      if [[ -s "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" ]]; then
         jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/pip-audit.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     semgrep)
+      echo "🚀 Running Semgrep scan…"
       runSemgrepScan "$source" "$real_target" "$SECURITY_SCAN_TEMP_DIR"
-      # Add Semgrep results to combined JSON
-      if [[ -f "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" && -s "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" ]]; then
+      if [[ -s "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" ]]; then
         jq -s '.[0] + .[1]' "$SECURITY_SCAN_COMBINED_JSON" "${SECURITY_SCAN_TEMP_DIR}/semgrep.json" >"${SECURITY_SCAN_COMBINED_JSON}.tmp" && mv "${SECURITY_SCAN_COMBINED_JSON}.tmp" "$SECURITY_SCAN_COMBINED_JSON"
       fi
       ;;
     *)
-      echo "⚠️  Unknown security-scan tool: $tool"
+      echo "⚠️  Unknown security‑scan tool: $tool"
       ;;
     esac
   done
 
-  # Export the combined JSON path so it's accessible to the caller
-  export SECURITY_SCAN_COMBINED_JSON="${SECURITY_SCAN_TEMP_DIR}/combined-security-results.json"
+  export SECURITY_SCAN_COMBINED_JSON
+  echo "🗂️  Combined security JSON at: $SECURITY_SCAN_COMBINED_JSON"
 }
 
 generateSecurityScanReportSection() {
@@ -1069,8 +893,8 @@ main() {
 
   # Security-scan variables
   RUN_SECURITY_SCAN=0
-  SECURITY_SCAN_TOOLS="trivy,bandit,safety,pip-audit,semgrep" # Default to all tools
-  FILTERED_TARGET_PATH=""                                     # Path to filtered target directory for scanning
+  SECURITY_SCAN_TOOLS="trivy,bandit,pip-audit,semgrep" # Default to all tools
+  FILTERED_TARGET_PATH=""                              # Path to filtered target directory for scanning
 
   AI_USER_PROMPT=""
   AI_RESPONSE_TMPFILE=""
@@ -1163,25 +987,19 @@ main() {
 
   if [[ $USE_AI -eq 1 ]]; then
     if [[ -s "$NUCLEI_OUTPUT_TMP" ]]; then
-      # Create a temporary file with full-matches added to the Nuclei output
       NUCLEI_WITH_FULL_TMP=$(mktemp)
       add_full_line_match "$NUCLEI_OUTPUT_TMP" >"$NUCLEI_WITH_FULL_TMP"
-      # Strip the /tmp/ from matched-at for both the Nuclei output and the AI response later
+
       NUCLEI_WITH_FULL_STRIPPED_TMP=$(mktemp)
       strip_tmp_from_matched_at "$NUCLEI_WITH_FULL_TMP" >"$NUCLEI_WITH_FULL_STRIPPED_TMP"
-      # Use the stripped Nuclei output as input to AI scoring
+
       AI_RESPONSE_TMPFILE=$(mktemp)
       ai_scoring "$NUCLEI_WITH_FULL_STRIPPED_TMP" "$AI_URL" "$AI_MODEL" "$AI_RESPONSE_TMPFILE"
-      # Now, we have:
-      #   $NUCLEI_WITH_FULL_STRIPPED_TMP: Nuclei output with full-matches and stripped matched-at
-      #   $AI_RESPONSE_TMPFILE: AI results with stripped matched-at (and hopefully full-matches)
-      # We will use these two files as input to generateReport.
+
       NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_WITH_FULL_STRIPPED_TMP"
       AI_RESPONSE_FOR_REPORT="$AI_RESPONSE_TMPFILE"
     else
       echo "✅ No findings from Nuclei, skipping AI analysis."
-      # In this case, we still want to run the non-AI path?
-      # We'll set the variables to the original Nuclei output (which is empty) and empty AI response.
       NUCLEI_OUTPUT_FOR_REPORT="$NUCLEI_OUTPUT_TMP"
       AI_RESPONSE_FOR_REPORT="/dev/null"
     fi
@@ -1201,14 +1019,12 @@ main() {
   fi
 
   # Run security-scan workflow if enabled
-  # if [[ "$RUN_SECURITY_SCAN" -eq 1 ]]; then
-  #   echo -e "\r🔒 Executing security-scan workflow..."
-  #   runSecurityScanWorkflow "" "$FILTERED_TARGET_PATH"
-  #   spinner_run "$!" "Running security-scan tools..."
-  #   echo -e "\r📋 Security-scan workflow completed."
-  #   # Set the security scan report path for later use
-  #   security_scan_report="${SECURITY_SCAN_TEMP_DIR}/security-scan-report.md"
-  # fi
+  if [[ "$RUN_SECURITY_SCAN" -eq 1 ]]; then
+    echo -e "\r🔒 Executing security-scan workflow..."
+    runSecurityScanWorkflow "" "$FILTERED_TARGET_PATH"
+    spinner_run "$!" "Running security-scan tools..."
+    echo -e "\r📋 Security-scan workflow completed."
+  fi
 
   if [[ "$MODE" == "git" && "$GIT_TARGET_TYPE" -ne 2 ]]; then
     git_exclude_script
@@ -1216,6 +1032,7 @@ main() {
 
   # Generate the final report using the processed inputs
   generateReport "$NUCLEI_OUTPUT_FOR_REPORT" "$AI_RESPONSE_FOR_REPORT"
+  generateSecurityScanReportSection "$SECURITY_SCAN_COMBINED_JSON" "$NUCLEI_REPORT_FILE"
 
   cleanup
 
